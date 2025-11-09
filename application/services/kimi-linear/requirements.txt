@@ -1,0 +1,28 @@
+# Kimi Linear 48B API - Sparse Activation A3B
+# 48B Total Parameters, 3B Active per Forward Pass
+
+# Core ML Framework
+torch==2.6.0
+transformers==4.49.0
+accelerate==1.2.1
+bitsandbytes==0.45.0
+
+# Sparse Attention Architecture (CRITICAL!)
+fla-core==0.4.0
+
+# API Framework
+fastapi==0.115.0
+uvicorn[standard]==0.34.0
+pydantic==2.10.0
+
+# Database
+asyncpg==0.30.0
+
+# System & Monitoring
+psutil==5.9.8
+numpy==1.26.2
+scipy==1.13.1
+
+# Utilities
+python-dotenv==1.0.1
+aiofiles==23.2.1

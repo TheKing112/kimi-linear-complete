@@ -1,0 +1,228 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: kimi-postgres-48b
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ${NETWORK_NAME}
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: kimi-redis-48b
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ${NETWORK_NAME}
+    restart: unless-stopped
+
+  kimi-linear:
+    build:
+      context: ./services/kimi-linear
+      dockerfile: Dockerfile
+      args:
+        MODEL_NAME: ${MODEL_NAME}
+        MODEL_PATH: ${MODEL_PATH}
+    container_name: kimi-linear-48b
+    shm_size: 64gb  # WICHTIG: Für 48B Modell
+    ipc: host
+    environment:
+      - MODEL_NAME=${MODEL_NAME}
+      - MODEL_PATH=${MODEL_PATH}
+      - DEVICE=${DEVICE}
+      - LOAD_IN_4BIT=${LOAD_IN_4BIT}
+      - TORCH_COMPILE=${TORCH_COMPILE}
+      - TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE}
+      - MAX_INPUT_LENGTH=${MAX_INPUT_LENGTH}
+      - PORT=8003
+      - CUDA_VISIBLE_DEVICES=0,1,2,3  # Alle GPUs nutzen
+      - HF_TOKEN=${HF_TOKEN:-""}
+    volumes:
+      - model_cache:${MODEL_PATH}
+      - ./services/kimi-linear:/app
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 600s  # 10 Minuten Start-Zeit
+    networks:
+      - ${NETWORK_NAME}
+    restart: unless-stopped
+
+  # Cognee Memory Service
+  cognee:
+    build: ./cognee
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./cognee:/app
+    environment:
+      - COGNEE_DB_URL=postgresql://cognee:password@postgres:5432/cognee
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - ${NETWORK_NAME}
+
+  # Discord Bot
+  discord-bot:
+    build: ./discord-bot
+    depends_on:
+      - kimi-linear
+      - cognee
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - KIMI_URL=http://kimi-linear:8003
+      - COGNEE_URL=http://cognee:8001
+      - DISCORD_CONTROL_USERS=${DISCORD_CONTROL_USERS}
+      - DISCORD_CONTROL_CHANNEL=${DISCORD_CONTROL_CHANNEL}
+      - DISCORD_OWNER_ID=${DISCORD_OWNER_ID}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./services/discord-bot:/app
+    restart: unless-stopped
+    networks:
+      - ${NETWORK_NAME}
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - ${NETWORK_NAME}
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - ${NETWORK_NAME}
+
+  # Node Exporter
+  node-exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - ${NETWORK_NAME}
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - kimi-linear
+      - cognee
+      - grafana
+    restart: unless-stopped
+    networks:
+      - ${NETWORK_NAME}
+
+  github-integration:
+    build:
+      context: ./services/github-integration
+      dockerfile: Dockerfile
+    container_name: kimi-github-integration
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - COGNEE_URL=${COGNEE_URL}
+      - KIMI_LINEAR_URL=${KIMI_LINEAR_URL}
+      - REDIS_URL=${REDIS_URL}
+    volumes:
+      - ./services/github-integration:/app
+      - /tmp/github-clones:/tmp/github-clones
+    ports:
+      - "8004:8004"
+    depends_on:
+      - cognee
+      - kimi-linear
+      - redis
+    networks:
+      - ${NETWORK_NAME}
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: kimi-network
+    driver: bridge

@@ -1,0 +1,23 @@
+# Kimi Linear Discord Bot
+# Code Generation & Memory Integration
+
+# Discord Library
+discord.py==2.3.2
+discord-py-slash-command==4.2.1
+
+# HTTP Client
+aiohttp==3.9.1
+aiofiles==23.2.1
+
+# Environment
+python-dotenv==1.0.1
+redis==5.0.1
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3.post1
+colorama==0.4.6
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+# Optional: For advanced features
+# pynacl==1.5.0  # For voice features
+# pillow==10.1.0  # For image processing

@@ -1,0 +1,13 @@
+# Nginx Configuration Helper
+# (Optional - nur wenn Custom Scripts)
+
+# SSL/TLS
+cryptography==41.0.7
+pyopenssl==24.0.0
+
+# Configuration Management
+jinja2==3.1.2
+pyyaml==6.0.1
+
+# Utilities
+python-dotenv==1.0.1

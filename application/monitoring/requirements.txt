@@ -1,0 +1,20 @@
+# Monitoring & Metrics Collection
+# Prometheus & Grafana Integration
+
+# Prometheus Client
+prometheus-client==0.19.0
+prometheus-async==22.2.0
+
+# Metrics & Monitoring
+psutil==5.9.8
+gpustat==1.1.1
+nvidia-ml-py==12.535.108
+
+# HTTP Server
+fastapi==0.115.0
+uvicorn[standard]==0.34.0
+
+# Utilities
+python-dotenv==1.0.1
+aiofiles==23.2.1
+schedule==1.2.0

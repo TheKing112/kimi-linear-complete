@@ -1,0 +1,35 @@
+# GitHub Integration Service
+# Repository Cloning & Autonomous Editing
+
+# API Framework
+fastapi==0.115.0
+uvicorn[standard]==0.34.0
+pydantic==2.10.0
+
+# GitHub API & Git Integration
+PyGithub==2.3.0
+GitPython==3.1.42
+
+# HTTP Client
+aiohttp==3.9.1
+httpx==0.25.2
+
+# Background Tasks
+celery==5.3.4
+redis==5.0.1
+
+# File Processing
+pathlib2==2.3.7
+python-magic==0.4.27
+
+# Utilities
+python-dotenv==1.0.1
+pyyaml==6.0.1
+jsonschema==4.20.0
+
+# Security
+cryptography==41.0.7
+python-jose==3.3.0
+
+# Temporary file handling
+tempdir==0.7.1
