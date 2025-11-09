@@ -9,8 +9,13 @@ import os
 import logging
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
+from collections import defaultdict
+from time import time
+import hmac
+import hashlib
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from .github_client import GitHubClient
@@ -26,6 +31,40 @@ app = FastAPI(
     description="Autonomous GitHub integration for Kimi Linear",
     version="1.0.0"
 )
+
+# ✅ CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ✅ Rate Limiter
+class RateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+        self.limits = {
+            "clone": (5, 3600),  # 5 per hour
+            "analyze": (10, 3600),  # 10 per hour
+            "webhook": (100, 60)  # 100 per minute
+        }
+    
+    def is_allowed(self, key: str, endpoint: str) -> bool:
+        now = time()
+        limit, window = self.limits.get(endpoint, (10, 60))
+        
+        requests = self.requests[f"{endpoint}:{key}"]
+        requests[:] = [req for req in requests if now - req < window]
+        
+        if len(requests) >= limit:
+            return False
+        
+        requests.append(now)
+        return True
+
+rate_limiter = RateLimiter()
 
 # Models
 class RepoCloneRequest(BaseModel):
@@ -66,8 +105,18 @@ async def startup_event():
     logger.info("🚀 GitHub Integration gestartet")
 
 @app.post("/repo/clone", status_code=202)
-async def clone_repository(request: RepoCloneRequest, background_tasks: BackgroundTasks):
+async def clone_repository(
+    request: RepoCloneRequest,
+    background_tasks: BackgroundTasks
+):
     """Klone Repository und starte Analyse im Hintergrund"""
+    # ✅ Rate limit check
+    if not rate_limiter.is_allowed(request.user_id, "clone"):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Max 5 clones per hour."
+        )
+    
     try:
         repo_id = github_client.extract_repo_id(request.repo_url)
         
@@ -89,12 +138,38 @@ async def clone_repository(request: RepoCloneRequest, background_tasks: Backgrou
         logger.error(f"Clone fehlgeschlagen: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ✅ Webhook signature verification
+def verify_webhook_signature(payload: bytes, signature: str) -> bool:
+    """Verify GitHub webhook signature"""
+    secret = os.getenv("GITHUB_WEBHOOK_SECRET")
+    if not secret:
+        logger.warning("No webhook secret configured")
+        return True  # Allow in dev
+    
+    expected = hmac.new(
+        secret.encode(),
+        payload,
+        hashlib.sha256
+    ).hexdigest()
+    
+    return hmac.compare_digest(f"sha256={expected}", signature)
+
 @app.post("/webhook/github")
 async def github_webhook(
-    payload: Dict[str, Any],
-    x_github_event: Optional[str] = Header(None)
+    request: Request,  # ✅ Changed to Request
+    x_github_event: Optional[str] = Header(None),
+    x_hub_signature_256: Optional[str] = Header(None)
 ):
     """Empfange GitHub Webhooks (push, pull_request, etc.)"""
+    # ✅ Verify signature
+    body = await request.body()
+    
+    if x_hub_signature_256:
+        if not verify_webhook_signature(body, x_hub_signature_256):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+    
+    payload = await request.json()
+    
     try:
         event_type = x_github_event or "ping"
         
@@ -132,7 +207,7 @@ async def health_check():
         # Bestimme Gesamt-Status
         if github_healthy and analyzer_healthy:
             status = "healthy"
-        elif not github_client.is_authenticated() if github_client else False:
+        elif github_client and not github_client.is_authenticated():
             status = "degraded"  # Funktioniert im read-only Modus
         else:
             status = "unhealthy"

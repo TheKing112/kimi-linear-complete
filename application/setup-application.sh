@@ -11,12 +11,28 @@ readonly LOG_FILE="/tmp/application-setup.log"
 log() { echo "[$(date +%T)] $1" | tee -a "$LOG_FILE"; }
 ok()  { echo "✓ $1" | tee -a "$LOG_FILE"; }
 error() { echo "✗ $1" | tee -a "$LOG_FILE"; exit 1; }
+warn() { echo "⚠ $1" | tee -a "$LOG_FILE"; }  # NEW: Warning helper
 
 # ==================================== CONFIGURATION ====================================
 
 readonly APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ==================================== SERVICE DEFINITIONS ====================================
+
+create_directories() {
+    log "Creating service directories..."
+    
+    mkdir -p services/{kimi-linear,cognee,discord-bot,github-integration}
+    mkdir -p services/kimi-linear/src
+    mkdir -p services/cognee/src
+    mkdir -p services/discord-bot/src
+    mkdir -p services/github-integration/src
+    mkdir -p monitoring/{prometheus,grafana/provisioning/{dashboards,datasources}}
+    mkdir -p init-scripts
+    mkdir -p logs/{kimi-linear,cognee,discord-bot,github-integration}
+    
+    ok "Created directory structure"
+}
 
 create_env_file() {
     if [[ -f .env ]]; then
@@ -115,6 +131,129 @@ EOF
     chmod 600 .env
     
     ok "Created .env with all variables (PLEASE EDIT TOKENS!)"
+}
+
+# ✅ NEU - Nach create_env_file()
+validate_env_file() {
+    log "Validating .env file..."
+    
+    required_vars=(
+        "DISCORD_BOT_TOKEN"
+        "POSTGRES_PASSWORD"
+        "MODEL_NAME"
+        "NETWORK_NAME"
+    )
+    
+    missing_vars=()
+    
+    for var in "${required_vars[@]}"; do
+        if ! grep -q "^${var}=" .env || grep -q "^${var}=your_" .env; then
+            missing_vars+=("$var")
+        fi
+    done
+    
+    if [ ${#missing_vars[@]} -gt 0 ]; then
+        warn "Missing or unconfigured variables:"
+        printf '  - %s\n' "${missing_vars[@]}" | tee -a "$LOG_FILE"
+        warn "Please edit .env before starting services"
+        return 1
+    fi
+    
+    ok "Environment variables validated"
+    return 0
+}
+
+create_init_scripts() {
+    log "Creating database init scripts..."
+    
+    # Base schema
+    cat > init-scripts/01-init.sql << 'EOF'
+-- ============================================================================
+-- Cognee Database Schema (Base)
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS memories (
+    id SERIAL PRIMARY KEY,
+    user_id VARCHAR(255) NOT NULL,
+    content TEXT NOT NULL,
+    embedding vector(384),
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_memories_user ON memories(user_id);
+CREATE INDEX idx_memories_created ON memories(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS knowledge_graph (
+    id SERIAL PRIMARY KEY,
+    user_id VARCHAR(255),
+    subject TEXT,
+    predicate TEXT,
+    object TEXT,
+    confidence FLOAT DEFAULT 0.8,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_knowledge_user ON knowledge_graph(user_id);
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+EOF
+
+    # Extended schema
+    cat > init-scripts/02-extended.sql << 'EOF'
+-- ============================================================================
+-- Extended Memory Schema
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS generation_metadata (
+    memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    prompt_text TEXT,
+    prompt_tokens INTEGER,
+    generated_tokens INTEGER,
+    total_tokens INTEGER,
+    generation_time_ms INTEGER,
+    temperature FLOAT,
+    top_p FLOAT,
+    model_name VARCHAR(255),
+    model_version VARCHAR(50),
+    gpu_device VARCHAR(50),
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS user_feedback (
+    id SERIAL PRIMARY KEY,
+    memory_id INTEGER REFERENCES memories(id) ON DELETE CASCADE,
+    user_id VARCHAR(255),
+    feedback_type VARCHAR(20),
+    feedback_data JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS conversation_threads (
+    id SERIAL PRIMARY KEY,
+    thread_id VARCHAR(255) UNIQUE,
+    user_id VARCHAR(255),
+    initial_prompt TEXT,
+    context JSONB,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE memories
+ADD COLUMN IF NOT EXISTS embedding_version VARCHAR(20) DEFAULT 'all-MiniLM-L6-v2-v1',
+ADD COLUMN IF NOT EXISTS tags TEXT[],
+ADD COLUMN IF NOT EXISTS is_autonomous BOOLEAN DEFAULT false,
+ADD COLUMN IF NOT EXISTS parent_memory_id INTEGER REFERENCES memories(id);
+
+CREATE INDEX idx_memories_tags ON memories USING GIN(tags);
+CREATE INDEX idx_memories_autonomous ON memories(is_autonomous) WHERE is_autonomous = true;
+EOF
+
+    ok "Created database init scripts"
 }
 
 create_docker_compose() {
@@ -395,7 +534,7 @@ for service in "${services[@]}"; do
        curl -sf "http://localhost:$port/api/health" &>/dev/null; then
         echo "✅ $name is healthy (port $port)"
     else
-        echo "⚠️  $name not responding (port $port)"
+        echo "⚠  $name not responding (port $port)"
     fi
 done
 
@@ -433,112 +572,41 @@ EOF
     ok "Created helper scripts"
 }
 
-create_directories() {
-    log "Creating service directories..."
+# ✅ NEU - Nach main()
+preflight_checks() {
+    log "Running preflight checks..."
     
-    mkdir -p services/{kimi-linear,cognee,discord-bot,github-integration}
-    mkdir -p services/kimi-linear/src
-    mkdir -p services/cognee/src
-    mkdir -p services/discord-bot/src
-    mkdir -p services/github-integration/src
-    mkdir -p monitoring/{prometheus,grafana/provisioning/{dashboards,datasources}}
-    mkdir -p init-scripts
-    mkdir -p logs/{kimi-linear,cognee,discord-bot,github-integration}
+    # Check Docker
+    if ! command -v docker &>/dev/null; then
+        error "Docker not installed"
+    fi
     
-    ok "Created directory structure"
-}
-
-create_init_scripts() {
-    log "Creating database init scripts..."
+    # Check Docker Compose (V1 or V2)
+    if command -v docker-compose &>/dev/null; then
+        log "Docker Compose V1 detected"
+    elif docker compose version &>/dev/null 2>&1; then
+        log "Docker Compose V2 detected"
+    else
+        error "Docker Compose not installed"
+    fi
     
-    # Base schema
-    cat > init-scripts/01-init.sql << 'EOF'
--- ============================================================================
--- Cognee Database Schema (Base)
--- ============================================================================
-
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE IF NOT EXISTS memories (
-    id SERIAL PRIMARY KEY,
-    user_id VARCHAR(255) NOT NULL,
-    content TEXT NOT NULL,
-    embedding vector(384),
-    metadata JSONB DEFAULT '{}',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_memories_user ON memories(user_id);
-CREATE INDEX idx_memories_created ON memories(created_at DESC);
-
-CREATE TABLE IF NOT EXISTS knowledge_graph (
-    id SERIAL PRIMARY KEY,
-    user_id VARCHAR(255),
-    subject TEXT,
-    predicate TEXT,
-    object TEXT,
-    confidence FLOAT DEFAULT 0.8,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_knowledge_user ON knowledge_graph(user_id);
-
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-EOF
-
-    # Extended schema
-    cat > init-scripts/02-extended.sql << 'EOF'
--- ============================================================================
--- Extended Memory Schema
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS generation_metadata (
-    memory_id INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
-    prompt_text TEXT,
-    prompt_tokens INTEGER,
-    generated_tokens INTEGER,
-    total_tokens INTEGER,
-    generation_time_ms INTEGER,
-    temperature FLOAT,
-    top_p FLOAT,
-    model_name VARCHAR(255),
-    model_version VARCHAR(50),
-    gpu_device VARCHAR(50),
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS user_feedback (
-    id SERIAL PRIMARY KEY,
-    memory_id INTEGER REFERENCES memories(id) ON DELETE CASCADE,
-    user_id VARCHAR(255),
-    feedback_type VARCHAR(20),
-    feedback_data JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS conversation_threads (
-    id SERIAL PRIMARY KEY,
-    thread_id VARCHAR(255) UNIQUE,
-    user_id VARCHAR(255),
-    initial_prompt TEXT,
-    context JSONB,
-    is_active BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-ALTER TABLE memories
-ADD COLUMN IF NOT EXISTS embedding_version VARCHAR(20) DEFAULT 'all-MiniLM-L6-v2-v1',
-ADD COLUMN IF NOT EXISTS tags TEXT[],
-ADD COLUMN IF NOT EXISTS is_autonomous BOOLEAN DEFAULT false,
-ADD COLUMN IF NOT EXISTS parent_memory_id INTEGER REFERENCES memories(id);
-
-CREATE INDEX idx_memories_tags ON memories USING GIN(tags);
-CREATE INDEX idx_memories_autonomous ON memories(is_autonomous) WHERE is_autonomous = true;
-EOF
-
-    ok "Created database init scripts"
+    # Check disk space
+    available_space=$(df -BG . | tail -1 | awk '{print $4}' | sed 's/G//')
+    if [ "$available_space" -lt 100 ]; then
+        warn "Low disk space: ${available_space}GB available"
+        warn "Recommended: 100GB+ for model storage"
+    else
+        log "Disk space check: ${available_space}GB available"
+    fi
+    
+    # Check nvidia-smi (optional)
+    if command -v nvidia-smi &>/dev/null; then
+        ok "GPU detected: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+    else
+        warn "No GPU detected - CPU mode only"
+    fi
+    
+    ok "Preflight checks complete"
 }
 
 # ==================================== MAIN ====================================
@@ -553,8 +621,11 @@ main() {
 ╚══════════════════════════════════════════════════════════════════════════════╝
 EOF
     
+    preflight_checks  # NEW: Run checks first
+    
     create_directories
     create_env_file
+    validate_env_file || true  # NEW: Validate .env (non-fatal)
     create_init_scripts
     create_docker_compose
     create_helper_scripts

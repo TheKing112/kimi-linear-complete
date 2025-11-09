@@ -1,15 +1,21 @@
+# ✅ Hinzufügen am Anfang
+import asyncio
+from typing import Optional, Dict, Any  # ✅ Erweiterte Typ-Definitionen
+import logging
+import os
+from datetime import datetime, timezone
+
+# ✅ NEU - Für Rate Limiting
+from collections import defaultdict
+from time import time
+
 import discord
 from discord.ext import commands
 import aiohttp
-import os
-import asyncio
-import logging
-from datetime import datetime, timezone
-from typing import Optional
 from fastapi import FastAPI
 import uvicorn
 from concurrent.futures import ThreadPoolExecutor
-from discord.ui import View, Button  # NEU für Approval-Flow
+from discord.ui import View, Button
 
 # Import Remote Control
 from remote_control import setup_remote_control
@@ -21,7 +27,7 @@ logger = logging.getLogger("kimi-bot-master")
 # FastAPI Health App
 health_app = FastAPI(
     title="Discord Bot Health API",
-    version="2.1.0"  # Version erhöht
+    version="2.1.0"
 )
 
 @health_app.get("/health")
@@ -59,10 +65,23 @@ intents.reactions = True
 # NEU: Approval View für autonome Edits
 class AutonomousApprovalView(View):
     def __init__(self, author_id: int, repo_url: str, prompt: str):
-        super().__init__(timeout=900)  # 15 Minuten Timeout
+        super().__init__(timeout=900)
         self.author_id = author_id
         self.repo_url = repo_url
         self.prompt = prompt
+        self.value = None  # ✅ NEU - Track result
+    
+    # ✅ NEU - Timeout Handler
+    async def on_timeout(self):
+        """Called when view times out"""
+        for item in self.children:
+            item.disabled = True
+        
+        if hasattr(self, 'message'):
+            await self.message.edit(
+                content="⏱️ Approval-Anfrage abgelaufen (15 Minuten)",
+                view=self
+            )
     
     @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green)
     async def approve_callback(self, button: Button, interaction: discord.Interaction):
@@ -72,7 +91,6 @@ class AutonomousApprovalView(View):
         
         await interaction.response.send_message("🚀 Starte autonome Bearbeitung...", ephemeral=True)
         
-        # Führe die autonome Bearbeitung aus
         try:
             result = await process_autonomous_edit(self.repo_url, self.prompt, str(interaction.user.id))
             await interaction.followup.send(f"✅ {result}", ephemeral=True)
@@ -86,6 +104,7 @@ class AutonomousApprovalView(View):
             await interaction.response.send_message("❌ Nicht autorisiert", ephemeral=True)
             return
         
+        self.value = False  # ✅ NEU - Set result
         await interaction.response.send_message("❌ Anfrage abgebrochen", ephemeral=True)
 
 class KimiBot(commands.Bot):
@@ -102,6 +121,7 @@ class KimiBot(commands.Bot):
         self.github_url = os.getenv("GITHUB_INTEGRATION_URL", "http://github-integration:8004")
         self.session: Optional[aiohttp.ClientSession] = None
         self.start_time = datetime.now(timezone.utc)
+        self.health_executor = None  # ✅ NEU - Executor speichern
         
     async def setup_hook(self):
         """Bot-Initialisierung"""
@@ -112,13 +132,6 @@ class KimiBot(commands.Bot):
         
         # Remote Control Cog laden
         await setup_remote_control(self)
-        
-        # Slash Commands registrieren
-        try:
-            await self.sync_commands()
-            logger.info("✅ Slash Commands synchronisiert")
-        except Exception as e:
-            logger.warning(f"Slash Commands Sync fehlgeschlagen: {e}")
         
         # HTTP Health Server starten
         def run_health_server():
@@ -131,17 +144,60 @@ class KimiBot(commands.Bot):
             )
         
         loop = asyncio.get_event_loop()
-        executor = ThreadPoolExecutor(max_workers=1)
-        loop.run_in_executor(executor, run_health_server)
+        self.health_executor = ThreadPoolExecutor(max_workers=1)  # ✅ Speichern
+        loop.run_in_executor(self.health_executor, run_health_server)
         
         logger.info("🤖 Discord Bot mit Remote Control initialisiert")
         logger.info("🌐 Health Check Server gestartet auf Port 8005")
         
     async def close(self):
         """Aufräumen beim Herunterfahren"""
-        if self.session:
-            await self.session.close()
+        try:
+            if self.session and not self.session.closed:
+                await self.session.close()
+                logger.info("HTTP Session geschlossen")
+        except Exception as e:
+            logger.error(f"Error closing session: {e}")
+        
+        # ✅ NEU - Executor cleanup
+        if self.health_executor:
+            self.health_executor.shutdown(wait=True)
+            logger.info("Health server executor shutdown")
+        
         await super().close()
+
+# ✅ NEU - Nach KimiBot Class Definition
+class RateLimiter:
+    def __init__(self, max_requests: int = 10, window: int = 60):
+        self.max_requests = max_requests
+        self.window = window
+        self.requests = defaultdict(list)
+    
+    def is_allowed(self, user_id: str) -> bool:
+        now = time()
+        user_requests = self.requests[user_id]
+        
+        # Entferne alte Requests
+        user_requests[:] = [req for req in user_requests if now - req < self.window]
+        
+        if len(user_requests) >= self.max_requests:
+            return False
+        
+        user_requests.append(now)
+        return True
+    
+    def reset(self, user_id: str):
+        self.requests.pop(user_id, None)
+
+# ✅ Instanz erstellen
+rate_limiter = RateLimiter(max_requests=10, window=60)
+
+# ✅ NEU - Spezifische Error Codes
+class BotError(Exception):
+    def __init__(self, code: str, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(message)
 
 # Bot-Instanz
 bot = KimiBot()
@@ -152,6 +208,13 @@ async def on_ready():
     logger.info(f"✅ {bot.user} ist online!")
     logger.info(f"📊 Verbunden mit {len(bot.guilds)} Server(n)")
     
+    # ✅ RICHTIG - Jetzt erst Commands synchronisieren
+    try:
+        synced = await bot.tree.sync()
+        logger.info(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        logger.error(f"Failed to sync commands: {e}")
+    
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="AI Code Generation")
     )
@@ -159,19 +222,36 @@ async def on_ready():
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
     """Globale Fehlerbehandlung"""
-    if isinstance(error, commands.CommandNotFound):
+    # ✅ RICHTIG - Spezifische Error Codes
+    if isinstance(error, BotError):
+        embed = discord.Embed(
+            title=f"❌ Fehler ({error.code})",
+            description=error.message,
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+    elif isinstance(error, commands.CommandNotFound):
         return
-    
-    logger.error(f"Command Error: {error}")
-    embed = discord.Embed(title="❌ Fehler", description=str(error), color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
-    await ctx.send(embed=embed)
+    else:
+        logger.error(f"Unhandled error: {error}", exc_info=True)
+        await ctx.send("❌ Ein unerwarteter Fehler ist aufgetreten.")
 
 # ===== CODE GENERATION =====
 @bot.command(name='code')
 async def generate_code(ctx: commands.Context, *, prompt: str):
     """Generiere Code mit Kimi Linear 48B"""
+    # ✅ Rate Limit Check
+    if not rate_limiter.is_allowed(str(ctx.author.id)):
+        await ctx.send("⏱️ Rate limit erreicht. Bitte warte 60 Sekunden.")
+        return
+    
+    # ✅ Input Validation
     if not prompt.strip():
         await ctx.send("⚠️ Bitte gib eine Beschreibung an!")
+        return
+    
+    if len(prompt) > 2000:
+        await ctx.send("❌ Prompt zu lang (max 2000 Zeichen)")
         return
     
     async with ctx.typing():
@@ -400,7 +480,7 @@ async def github_status_command(ctx: commands.Context):
             rl = data["rate_limit"]
             embed.add_field(name="API Rate Limit", value=f"{rl['remaining']}/{rl['limit']} verbleibend", inline=False)
         
-        await ctx.send(embed)
+        await ctx.send(embed=embed)
     except Exception as e:
         logger.error(f"GitHub Status Fehler: {e}")
         await ctx.send("❌ Status abrufen fehlgeschlagen")
@@ -413,7 +493,6 @@ async def autonomous_edit(ctx: commands.Context, repo_url: str, *, prompt: str):
         await ctx.send("❌ Bitte gib eine Anfrage an (z.B. 'Add error handling to all API endpoints')")
         return
     
-    # Zeige Preview mit Approval-Buttons
     view = AutonomousApprovalView(ctx.author.id, repo_url, prompt)
     embed = discord.Embed(
         title="🤖 Autonome Änderung - Bestätigung erforderlich", 
@@ -424,7 +503,9 @@ async def autonomous_edit(ctx: commands.Context, repo_url: str, *, prompt: str):
     embed.add_field(name="Anfrage", value=prompt, inline=False)
     embed.set_footer(text="Nur der Anfragende kann approve/deny")
     
-    await ctx.send(embed=embed, view=view)
+    # ✅ NEU - Speichere Message Referenz für Timeout
+    message = await ctx.send(embed=embed, view=view)
+    view.message = message
 
 # NEU: Slash Command als Alternative
 @bot.slash_command(name="autonomous", description="Starte autonome Repository-Änderung (mit Approval)")

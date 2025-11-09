@@ -1,6 +1,7 @@
 -- =============================================================================
 -- KIMI LINEAR - COGNEE DATABASE INITIALIZATION
 -- PostgreSQL mit pgvector Extension
+-- Version: 2.0
 -- Embedding Dimension: 384 (für all-MiniLM-L6-v2)
 -- =============================================================================
 
@@ -23,6 +24,7 @@ CREATE TABLE memories (
     content TEXT NOT NULL,
     embedding vector(384),  -- Dimension für all-MiniLM-L6-v2
     metadata JSONB DEFAULT '{}'::jsonb,
+    is_autonomous BOOLEAN DEFAULT false,  -- Flag für autonome Generierungen
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -45,6 +47,15 @@ CREATE TABLE knowledge_graph (
 );
 
 -- =============================================================================
+-- UNIQUE CONSTRAINTS: Datenintegrität sichern
+-- =============================================================================
+
+-- Verhindert doppelte Knowledge Graph Tripel (user, subj, pred, obj)
+ALTER TABLE knowledge_graph 
+ADD CONSTRAINT unique_kg_triple 
+UNIQUE (user_id, subject, predicate, object);
+
+-- =============================================================================
 -- INDEXES: Performance Optimierung
 -- =============================================================================
 
@@ -60,6 +71,20 @@ CREATE INDEX idx_knowledge_metadata ON knowledge_graph USING GIN(metadata);
 CREATE INDEX idx_knowledge_user ON knowledge_graph(user_id);
 CREATE INDEX idx_knowledge_subject ON knowledge_graph(subject);
 CREATE INDEX idx_knowledge_predicate ON knowledge_graph(predicate);
+
+-- Performance für Pagination (Composite Index)
+CREATE INDEX IF NOT EXISTS idx_memories_user_created 
+ON memories(user_id, created_at DESC);
+
+-- Composite Index für häufige Queries nach autonomen Generierungen
+CREATE INDEX IF NOT EXISTS idx_memories_user_autonomous 
+ON memories(user_id, is_autonomous) 
+WHERE is_autonomous = true;
+
+-- Additional Time-based Index für cleanup_old_memories
+CREATE INDEX IF NOT EXISTS idx_memories_created_at 
+ON memories(created_at) 
+WHERE metadata->>'keep_forever' IS DISTINCT FROM 'true';
 
 -- =============================================================================
 -- INDEX: Vector Search (IVFFLAT)
@@ -152,14 +177,155 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =============================================================================
--- SAMPLE DATA: Optional - Testdaten für erste Verifikation
+-- FUNCTION: Batch Insert für Knowledge Graph (Robust & Atomic)
+-- Fügt mehrere Knowledge Graph Einträge in einer Transaktion ein
+-- Parameter update_on_conflict: true = aktualisiert confidence, false = überspringt
 -- =============================================================================
--- INSERT INTO memories (user_id, content, embedding, metadata) VALUES
--- ('test_user', 'def fibonacci(n): return n if n <= 1 else fibonacci(n-1) + fibonacci(n-2)', 
---  NULL,  -- Embedding würde in Python generiert
---  '{"language": "python", "type": "function"}'::jsonb);
+CREATE OR REPLACE FUNCTION batch_insert_knowledge(
+    entries JSONB,
+    update_on_conflict BOOLEAN DEFAULT true
+)
+RETURNS INTEGER AS $$
+DECLARE
+    inserted_count INTEGER := 0;
+BEGIN
+    -- Atomic INSERT mit unnest für Performance
+    INSERT INTO knowledge_graph (user_id, subject, predicate, object, confidence)
+    SELECT 
+        e->>'user_id',
+        e->>'subject',
+        e->>'predicate',
+        e->>'object',
+        (e->>'confidence')::FLOAT
+    FROM jsonb_array_elements(entries) e
+    ON CONFLICT (user_id, subject, predicate, object)
+    DO UPDATE SET
+        confidence = CASE 
+            WHEN update_on_conflict THEN GREATEST(knowledge_graph.confidence, excluded.confidence)
+            ELSE knowledge_graph.confidence
+        END,
+        metadata = CASE 
+            WHEN update_on_conflict THEN 
+                COALESCE(excluded.metadata, knowledge_graph.metadata)
+            ELSE knowledge_graph.metadata
+        END,
+        created_at = CASE 
+            WHEN update_on_conflict THEN CURRENT_TIMESTAMP
+            ELSE knowledge_graph.created_at
+        END;
+    
+    GET DIAGNOSTICS inserted_count = ROW_COUNT;
+    RETURN inserted_count;
+END;
+$$ LANGUAGE plpgsql;
 
 -- =============================================================================
--- DONE
+-- FUNCTION: Cleanup alter Memories (Safe & Efficient)
+-- Löscht Memories die älter als X Tage sind, außer sie sind als 'keep_forever' markiert
 -- =============================================================================
-SELECT '✅ Cognee Database Schema erfolgreich initialisiert!' AS status;
+CREATE OR REPLACE FUNCTION cleanup_old_memories(
+    days_old INTEGER DEFAULT 90,
+    max_batch_size INTEGER DEFAULT 10000
+)
+RETURNS INTEGER AS $$
+DECLARE
+    deleted_count INTEGER := 0;
+    batch_count INTEGER;
+BEGIN
+    -- Loop in Batches für große Löschmengen (verhindert lange Locks)
+    LOOP
+        DELETE FROM memories
+        WHERE id IN (
+            SELECT id
+            FROM memories
+            WHERE created_at < NOW() - (days_old || ' days')::INTERVAL
+            AND metadata->>'keep_forever' IS DISTINCT FROM 'true'
+            LIMIT max_batch_size
+        );
+        
+        GET DIAGNOSTICS batch_count = ROW_COUNT;
+        deleted_count := deleted_count + batch_count;
+        
+        EXIT WHEN batch_count = 0;
+    END LOOP;
+    
+    RETURN deleted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- =============================================================================
+-- FUNCTION: Get Memory Statistics
+-- Gibt Statistiken für einen User zurück
+-- =============================================================================
+CREATE OR REPLACE FUNCTION get_memory_stats(
+    target_user_id VARCHAR(255) DEFAULT NULL
+)
+RETURNS TABLE(
+    user_id VARCHAR(255),
+    total_memories BIGINT,
+    autonomous_memories BIGINT,
+    avg_confidence FLOAT,
+    oldest_memories_days INTEGER,
+    newest_memory TIMESTAMP
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        m.user_id,
+        COUNT(*)::BIGINT AS total_memories,
+        SUM(CASE WHEN m.is_autonomous THEN 1 ELSE 0 END)::BIGINT AS autonomous_memories,
+        AVG((m.metadata->>'confidence')::FLOAT) AS avg_confidence,
+        EXTRACT(DAY FROM NOW() - MIN(m.created_at))::INTEGER AS oldest_memories_days,
+        MAX(m.created_at) AS newest_memory
+    FROM memories m
+    WHERE (target_user_id IS NULL OR m.user_id = target_user_id)
+    GROUP BY m.user_id
+    ORDER BY total_memories DESC;
+END;
+$$ LANGUAGE plpgsql;
+
+-- =============================================================================
+-- MIGRATION HELPER: Duplikate bereinigen (falls Schema auf bestehende DB angewendet)
+-- Auskommentiert für Neuinstallation - nur bei Bedarf aktivieren
+-- =============================================================================
+/*
+-- 1. Duplikate im Knowledge Graph finden
+SELECT user_id, subject, predicate, object, COUNT(*)
+FROM knowledge_graph
+GROUP BY user_id, subject, predicate, object
+HAVING COUNT(*) > 1;
+
+-- 2. Duplikate entfernen (nur den mit höchstem Confidence behalten)
+DELETE FROM knowledge_graph
+WHERE id NOT IN (
+    SELECT DISTINCT ON (user_id, subject, predicate, object) id
+    FROM knowledge_graph
+    ORDER BY user_id, subject, predicate, object, confidence DESC, created_at DESC
+);
+
+-- 3. Dann UNIQUE CONSTRAINT hinzufügen (falls noch nicht vorhanden)
+ALTER TABLE knowledge_graph 
+ADD CONSTRAINT IF NOT EXISTS unique_kg_triple 
+UNIQUE (user_id, subject, predicate, object);
+*/
+
+-- =============================================================================
+-- SAMPLE DATA: Optional - Testdaten für erste Verifikation
+-- =============================================================================
+-- INSERT INTO memories (user_id, content, embedding, metadata, is_autonomous) VALUES
+-- ('test_user', 'def fibonacci(n): return n if n <= 1 else fibonacci(n-1) + fibonacci(n-2)', 
+--  NULL,  -- Embedding würde in Python generiert
+--  '{"language": "python", "type": "function", "confidence": 0.95}'::jsonb,
+--  true
+-- );
+
+-- INSERT INTO knowledge_graph (user_id, subject, predicate, object, confidence) VALUES
+-- ('test_user', 'fibonacci', 'function', 'recursion', 0.85),
+-- ('test_user', 'fibonacci', 'returns', 'int', 0.9),
+-- ('test_user', 'fibonacci', 'calls', 'fibonacci', 0.95);
+
+-- =============================================================================
+-- DONE: Schema erfolgreich initialisiert
+-- =============================================================================
+SELECT '✅ Cognee Database Schema v2.0 erfolgreich initialisiert!' AS status,
+       CURRENT_TIMESTAMP AS initialized_at;

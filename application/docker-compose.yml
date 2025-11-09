@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: pgvector/pgvector:pg15
@@ -10,8 +8,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    expose:
+      - "5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
@@ -27,6 +25,8 @@ services:
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    expose:
+      - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -44,7 +44,7 @@ services:
         MODEL_NAME: ${MODEL_NAME}
         MODEL_PATH: ${MODEL_PATH}
     container_name: kimi-linear-48b
-    shm_size: 64gb  # WICHTIG: Für 48B Modell
+    shm_size: 64gb
     ipc: host
     environment:
       - MODEL_NAME=${MODEL_NAME}
@@ -55,11 +55,11 @@ services:
       - TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE}
       - MAX_INPUT_LENGTH=${MAX_INPUT_LENGTH}
       - PORT=8003
-      - CUDA_VISIBLE_DEVICES=0,1,2,3  # Alle GPUs nutzen
+      - CUDA_VISIBLE_DEVICES=0,1,2,3
       - HF_TOKEN=${HF_TOKEN:-""}
     volumes:
-      - model_cache:${MODEL_PATH}
-      - ./services/kimi-linear:/app
+      - ./models/kimi-linear-48b:${MODEL_PATH}:rw
+      - ./services/kimi-linear:/app:ro
       - ~/.cache/huggingface:/root/.cache/huggingface
     ports:
       - "8003:8003"
@@ -80,19 +80,19 @@ services:
       interval: 60s
       timeout: 30s
       retries: 5
-      start_period: 600s  # 10 Minuten Start-Zeit
+      start_period: 1200s
     networks:
       - ${NETWORK_NAME}
     restart: unless-stopped
 
-  # Cognee Memory Service
   cognee:
     build: ./cognee
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      - ./cognee:/app
+      - ./cognee:/app:ro
+      - cognee_logs:/app/logs
     environment:
       - COGNEE_DB_URL=postgresql://cognee:password@postgres:5432/cognee
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
@@ -106,14 +106,17 @@ services:
     networks:
       - ${NETWORK_NAME}
 
-  # Discord Bot
   discord-bot:
     build: ./discord-bot
     depends_on:
-      - kimi-linear
-      - cognee
+      kimi-linear:
+        condition: service_healthy
+      cognee:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - KIMI_URL=http://kimi-linear:8003
       - COGNEE_URL=http://cognee:8001
       - DISCORD_CONTROL_USERS=${DISCORD_CONTROL_USERS}
@@ -121,14 +124,17 @@ services:
       - DISCORD_OWNER_ID=${DISCORD_OWNER_ID}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./services/discord-bot:/app
+      - ./services/discord-bot:/app:ro
+      - discord_logs:/app/logs
     restart: unless-stopped
     networks:
       - ${NETWORK_NAME}
 
-  # Prometheus Monitoring
   prometheus:
     image: prom/prometheus:latest
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "9090:9090"
     volumes:
@@ -144,9 +150,12 @@ services:
     networks:
       - ${NETWORK_NAME}
 
-  # Grafana Dashboard
   grafana:
     image: grafana/grafana:latest
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/lib/grafana/plugins
     ports:
       - "3000:3000"
     environment:
@@ -159,7 +168,6 @@ services:
     networks:
       - ${NETWORK_NAME}
 
-  # Node Exporter
   node-exporter:
     image: prom/node-exporter:latest
     ports:
@@ -176,7 +184,6 @@ services:
     networks:
       - ${NETWORK_NAME}
 
-  # Nginx Reverse Proxy
   nginx:
     image: nginx:alpine
     ports:
@@ -204,8 +211,9 @@ services:
       - KIMI_LINEAR_URL=${KIMI_LINEAR_URL}
       - REDIS_URL=${REDIS_URL}
     volumes:
-      - ./services/github-integration:/app
+      - ./services/github-integration:/app:ro
       - /tmp/github-clones:/tmp/github-clones
+      - github_logs:/app/logs
     ports:
       - "8004:8004"
     depends_on:
@@ -221,8 +229,11 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  discord_logs:
+  cognee_logs:
+  github_logs:
 
 networks:
-  default:
-    name: kimi-network
+  kimi-network:
     driver: bridge
+    name: ${NETWORK_NAME}

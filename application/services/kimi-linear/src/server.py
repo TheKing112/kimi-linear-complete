@@ -12,6 +12,8 @@ import time
 import psutil
 import json
 import asyncpg
+import asyncio
+import signal
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -30,6 +32,23 @@ app = FastAPI(
     description="48B Parameters, 3B Active per Forward Pass",
     version="1.0.0"
 )
+
+# ✅ NEU - Nach app Definition
+def signal_handler(signum, frame):
+    """Handle shutdown signals"""
+    logger.info(f"Received signal {signum}, shutting down gracefully...")
+    
+    # Clear GPU cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Exit
+    import sys
+    sys.exit(0)
+
+# Register handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
 
 # Pydantic Models
 class ChatMessage(BaseModel):
@@ -60,6 +79,14 @@ class HealthResponse(BaseModel):
 model: Optional[torch.nn.Module] = None
 tokenizer: Optional[AutoTokenizer] = None
 model_config: Dict[str, Any] = {}
+
+# ✅ NEU - Memory Monitoring
+def check_memory_available(required_gb: float = 2.0) -> bool:
+    """Check if enough memory available"""
+    if torch.cuda.is_available():
+        free_memory = torch.cuda.mem_get_info()[0] / (1024**3)
+        return free_memory >= required_gb
+    return True
 
 def load_model():
     """Load Kimi Linear 48B with Sparse Activation (A3B)"""
@@ -221,80 +248,104 @@ async def store_generation_metadata(memory_id: int, metadata: Dict[str, Any]):
 
 @app.on_event("startup")
 async def startup_event():
-    """Startup: Load model asynchronously"""
+    """Startup: Load model"""
     try:
         load_model()
+        logger.info("✅ Model loaded successfully")
     except Exception as e:
-        logger.error(f"Startup failed: {e}")
-        # Don't exit - let health check fail
+        logger.error(f"❌ CRITICAL: Model loading failed: {e}", exc_info=True)
+        # ✅ Exit mit Error Code
+        import sys
+        sys.exit(1)
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
-    """Generate text/code with Kimi Linear"""
+    """Generate with timeout"""
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    try:
-        start_time = time.time()
-        
-        # Prepare input
-        prompt = build_prompt(request)
-        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        
-        input_length = inputs["input_ids"].shape[1]
-        
-        # Generate
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=request.max_tokens,
-                temperature=request.temperature,
-                top_p=request.top_p,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True
-            )
-        
-        # Decode only new tokens
-        generated_tokens = outputs[0][input_length:]
-        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
-        generation_time = (time.time() - start_time) * 1000
-        
-        # Prepare response
-        response = GenerateResponse(
-            text=generated_text,
-            tokens_used=len(generated_tokens),
-            model=model_config["model_name"],
-            generation_time_ms=generation_time,
-            memory_id=None  # Will be set if stored
+    # ✅ NEU - Memory Check
+    if not check_memory_available(required_gb=1.5):
+        raise HTTPException(
+            status_code=503,
+            detail="Insufficient GPU memory. Please try again later."
         )
-        
-        # Store extended metadata if requested
-        if request.store_metadata:
-            meta = {
-                "prompt_text": prompt[:500],  # Truncate for storage
-                "prompt_tokens": input_length,
-                "generated_tokens": len(generated_tokens),
-                "total_tokens": input_length + len(generated_tokens),
-                "generation_time_ms": generation_time,
-                "temperature": request.temperature,
-                "top_p": request.top_p,
-                "model_name": model_config["model_name"],
-                "model_version": "1.0.0",
-                "gpu_device": str(model.device)
-            }
-            
-            # Note: In production, you'd want to store this asynchronously
-            # and return the memory_id in the response
-        
-        return response
     
+    try:
+        # ✅ NEU - Mit Timeout
+        result = await asyncio.wait_for(
+            generate_internal(request),
+            timeout=300.0  # 5 Minuten max
+        )
+        return result
+    
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="Generation timeout (5 minutes)"
+        )
     except Exception as e:
         logger.error(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+async def generate_internal(request: GenerateRequest) -> GenerateResponse:
+    """Internal generation logic"""
+    start_time = time.time()
+    
+    # Prepare input
+    prompt = build_prompt(request)
+    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    
+    input_length = inputs["input_ids"].shape[1]
+    
+    # Generate
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True
+        )
+    
+    # Decode only new tokens
+    generated_tokens = outputs[0][input_length:]
+    generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    
+    generation_time = (time.time() - start_time) * 1000
+    
+    # Prepare response
+    response = GenerateResponse(
+        text=generated_text,
+        tokens_used=len(generated_tokens),
+        model=model_config["model_name"],
+        generation_time_ms=generation_time,
+        memory_id=None  # Will be set if stored
+    )
+    
+    # Store extended metadata if requested
+    if request.store_metadata:
+        meta = {
+            "prompt_text": prompt[:500],  # Truncate for storage
+            "prompt_tokens": input_length,
+            "generated_tokens": len(generated_tokens),
+            "total_tokens": input_length + len(generated_tokens),
+            "generation_time_ms": generation_time,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "model_name": model_config["model_name"],
+            "model_version": "1.0.0",
+            "gpu_device": str(model.device)
+        }
+        
+        # Note: In production, you'd want to store this asynchronously
+        # and return the memory_id in the response
+    
+    return response
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():

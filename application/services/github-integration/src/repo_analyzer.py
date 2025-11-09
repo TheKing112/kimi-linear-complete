@@ -1,5 +1,7 @@
 import os
 import aiohttp
+import aiofiles
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Any
 import re
@@ -11,9 +13,23 @@ class RepositoryAnalyzer:
     def __init__(self):
         self.IGNORE_PATHS = {
             ".git", "__pycache__", ".venv", "venv", "node_modules",
-            "dist", "build", ".idea", ".vscode", "*.pyc", "*.pyo"
+            "dist", "build", ".idea", ".vscode", ".pytest_cache",
+            ".mypy_cache", ".tox", "htmlcov", ".coverage",
+            "*.pyc", "*.pyo", "*.pyd", ".DS_Store"
         }
-        self.SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".tsx", ".jsx", ".md", ".txt"}
+        self.IGNORE_PATTERNS = [
+            r".*\.egg-info$",
+            r".*\.so$",
+            r".*\.dylib$",
+            r".*\.log$",
+            r".*\.tmp$"
+        ]
+        self.SUPPORTED_EXTENSIONS = {
+            ".py", ".js", ".ts", ".tsx", ".jsx",
+            ".md", ".txt", ".json", ".yaml", ".yml",
+            ".toml", ".ini", ".cfg"
+        }
+        self.MAX_FILE_SIZE = 1_000_000  # 1MB
     
     async def clone_and_analyze(self, repo_url: str, branch: str, user_id: str, auto_analyze: bool):
         """Klone und analysiere Repository asynchron"""
@@ -26,11 +42,12 @@ class RepositoryAnalyzer:
             await self.analyze_repository(repo_dir, user_id, repo_url)
     
     async def analyze_repository(self, repo_path: str, user_id: str, repo_url: str):
-        """Analysiere alle Dateien und speichere in Cognee"""
-        logger.info(f"Analysiere Repository: {repo_path}")
+        """Analyze repository with async file operations"""
+        logger.info(f"Analyzing repository: {repo_path}")
         
         files_processed = 0
         total_size = 0
+        tasks = []
         
         for file_path in Path(repo_path).rglob("*"):
             if self.should_ignore(file_path):
@@ -39,34 +56,103 @@ class RepositoryAnalyzer:
             if file_path.suffix not in self.SUPPORTED_EXTENSIONS:
                 continue
             
-            try:
-                file_content = file_path.read_text(encoding="utf-8")
-                relative_path = file_path.relative_to(repo_path)
-                
-                # Speichere in Cognee Memory
-                await self.store_file_in_cognee(
-                    user_id=user_id,
-                    content=file_content,
-                    file_path=str(relative_path),
-                    repo_url=repo_url
-                )
-                
-                files_processed += 1
-                total_size += len(file_content)
-                
-                if files_processed % 10 == 0:
-                    logger.info(f"  → {files_processed} Dateien verarbeitet...")
+            if not file_path.is_file():
+                continue
             
-            except Exception as e:
-                logger.warning(f"Fehler bei {file_path}: {e}")
+            task = self.process_file(file_path, repo_path, user_id, repo_url)
+            tasks.append(task)
+            
+            if len(tasks) >= 10:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.warning(f"File processing error: {result}")
+                    elif result:
+                        files_processed += 1
+                        total_size += result
+                
+                tasks = []
+                
+                if files_processed % 50 == 0:
+                    logger.info(f"  → {files_processed} files processed...")
         
-        logger.info(f"✅ Repository-Analyse abgeschlossen: {files_processed} Dateien, {total_size/1024:.2f} KB")
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"File processing error: {result}")
+                elif result:
+                    files_processed += 1
+                    total_size += result
+        
+        logger.info(
+            f"✅ Repository analysis complete: {files_processed} files, "
+            f"{total_size/1024:.2f} KB"
+        )
+    
+    async def process_file(
+        self,
+        file_path: Path,
+        repo_path: str,
+        user_id: str,
+        repo_url: str
+    ) -> int:
+        """Process single file"""
+        try:
+            file_content = await self.read_file_async(file_path)
+            relative_path = file_path.relative_to(repo_path)
+            
+            if not file_content.strip():
+                return 0
+            
+            if len(file_content) > self.MAX_FILE_SIZE:
+                logger.warning(f"Skipping large file: {relative_path}")
+                return 0
+            
+            await self.store_file_in_cognee(
+                user_id=user_id,
+                content=file_content,
+                file_path=str(relative_path),
+                repo_url=repo_url
+            )
+            
+            return len(file_content)
+        
+        except Exception as e:
+            logger.warning(f"Error processing {file_path}: {e}")
+            return 0
+    
+    async def read_file_async(self, file_path: Path) -> str:
+        """Read file asynchronously"""
+        try:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                return await f.read()
+        except UnicodeDecodeError:
+            async with aiofiles.open(file_path, 'r', encoding='latin-1') as f:
+                return await f.read()
+        except Exception as e:
+            logger.warning(f"Could not read {file_path}: {e}")
+            return ""
     
     def should_ignore(self, path: Path) -> bool:
-        """Prüfe ob Pfad ignoriert werden soll"""
+        """Check if path should be ignored"""
+        path_str = str(path)
+        
         for ignore in self.IGNORE_PATHS:
-            if ignore in str(path):
+            if ignore in path_str:
                 return True
+        
+        for pattern in self.IGNORE_PATTERNS:
+            if re.match(pattern, path_str):
+                return True
+        
+        try:
+            if path.is_file() and path.stat().st_size > self.MAX_FILE_SIZE:
+                logger.info(f"Skipping large file: {path}")
+                return True
+        except:
+            pass
+        
         return False
     
     async def store_file_in_cognee(self, user_id: str, content: str, file_path: str, repo_url: str):

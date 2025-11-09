@@ -17,6 +17,7 @@ import uuid
 import time
 import asyncio
 import logging
+import aiohttp  # ✅ NEU
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -30,6 +31,12 @@ class ConflictError(Exception):
 class TimeoutError(Exception):
     """Operation timed out"""
     pass
+
+class HTTPException(Exception):  # ✅ NEU
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"HTTP {status_code}: {detail}")
 
 class AutonomousEditor:
     def __init__(self, github_url: str, redis_client: 'RedisClient', timeout: int = 30):
@@ -50,14 +57,31 @@ class AutonomousEditor:
         self.require_approval = os.getenv("AUTONOMOUS_REQUIRE_APPROVAL", "true").lower() == "true"
         self.create_branch = os.getenv("AUTONOMOUS_CREATE_BRANCH", "true").lower() == "true"
         self.max_tokens = int(os.getenv("AUTONOMOUS_MAX_TOKENS", "4096"))
-        
+
     def _validate_github_url(self, url: str) -> bool:
-        """🔗 URL-Validierung mit verbessertem Pattern"""
+        """Validate GitHub URL with improved pattern"""
+        # Basic pattern check
         pattern = r"^https://github\.com/[a-zA-Z0-9-_.]+/[a-zA-Z0-9-_.]+/?$"
         if not re.match(pattern, url):
-            raise ValueError(f"Ungültige GitHub URL: {url}. Format: https://github.com/owner/repo")
+            raise ValueError(f"Invalid GitHub URL: {url}")
+        
+        # ✅ NEU - Zusätzliche Checks
+        if url.count('/') < 4:
+            raise ValueError("URL must include owner and repo")
+        
+        parts = url.rstrip('/').split('/')
+        owner, repo = parts[-2], parts[-1]
+        
+        if len(owner) < 1 or len(repo) < 1:
+            raise ValueError("Owner and repo names cannot be empty")
+        
+        # Check for suspicious characters
+        suspicious = ['..', '<', '>', '|', '&', ';']
+        if any(char in url for char in suspicious):
+            raise ValueError("URL contains suspicious characters")
+        
         return True
-    
+
     def create_implementation_plan(self, analysis: Dict[str, Any], risk_enum: Any) -> Dict[str, Any]:
         """Erstelle detaillierten Plan für die Änderungen mit 🆔 UUID-Branch-Namen"""
         
@@ -85,6 +109,33 @@ class AutonomousEditor:
         
         return plan
 
+    async def acquire_lock_with_retry(  # ✅ NEU
+        self,
+        lock_name: str,
+        max_retries: int = 3,
+        base_delay: float = 1.0
+    ) -> bool:
+        """Acquire lock with exponential backoff"""
+        for attempt in range(max_retries):
+            try:
+                acquired = await asyncio.wait_for(
+                    self.redis_client.acquire_lock(lock_name),
+                    timeout=5
+                )
+                
+                if acquired:
+                    return True
+                
+                # Exponential backoff
+                delay = base_delay * (2 ** attempt)
+                logger.info(f"Lock busy, retrying in {delay}s...")
+                await asyncio.sleep(delay)
+            
+            except asyncio.TimeoutError:
+                logger.warning(f"Lock acquisition timeout (attempt {attempt + 1})")
+        
+        return False
+
     async def process_autonomous_request(
         self, 
         prompt: str, 
@@ -102,14 +153,12 @@ class AutonomousEditor:
         operation_metrics = {}
         
         try:
-            # ⏱️ Lock-Acquisition mit Timeout
+            # ⏱️ Lock-Acquisition mit Retry
             lock_name = f"github:{repo_url}"
             lock_start = time.monotonic()
             
-            lock_acquired = await asyncio.wait_for(
-                self.redis_client.acquire_lock(lock_name),
-                timeout=self.timeout
-            )
+            lock_acquired = await self.acquire_lock_with_retry(lock_name)  # ✅ VERBESSERT
+            
             operation_metrics['lock_acquisition_ms'] = round((time.monotonic() - lock_start) * 1000, 2)
             
             if not lock_acquired:
@@ -206,9 +255,11 @@ class AutonomousEditor:
         return round((time.monotonic() - start_time) * 1000, 2)
     
     def _enhance_error(self, error: Exception, start_time: float, metrics: Dict) -> Exception:
-        """⏱️ Fehler mit Latency-Informationen anreichern"""
-        error.latency_ms = self._get_latency_ms(start_time)
-        error.operation_metrics = metrics
+        """✅ Sichere Attribute-Zuweisung"""
+        if not hasattr(error, 'latency_ms'):
+            error.latency_ms = self._get_latency_ms(start_time)
+        if not hasattr(error, 'operation_metrics'):
+            error.operation_metrics = metrics
         return error
 
     async def analyze_prompt_and_repo(self, prompt: str, repo_url: str, user_id: str) -> Dict[str, Any]:
@@ -370,24 +421,47 @@ class AutonomousEditor:
         
         return {"files": [], "languages": [], "last_updated": None}
 
-    async def query_kimi(self, prompt: str) -> Dict[str, Any]:
-        """Hilfsfunktion: Frage Kimi Linear"""
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.kimi_url}/generate",
-                json={
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ],
-                    "max_tokens": self.max_tokens
-                }
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # Parse JSON aus Text-Antwort
-                    try:
-                        return json.loads(data["text"])
-                    except:
-                        return {"text": data["text"]}
+    async def query_kimi(self, prompt: str, max_retries: int = 3) -> Dict[str, Any]:  # ✅ VERBESSERT
+        """Query Kimi Linear with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.kimi_url}/generate",
+                        json={
+                            "messages": [
+                                {"role": "user", "content": prompt}
+                            ],
+                            "max_tokens": self.max_tokens
+                        },
+                        timeout=aiohttp.ClientTimeout(total=300)
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            try:
+                                return json.loads(data["text"])
+                            except json.JSONDecodeError:
+                                return {"text": data["text"]}
+                        elif resp.status == 503:
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(2 ** attempt)
+                                continue
+                            raise HTTPException(503, "Kimi service unavailable")
+                        else:
+                            raise HTTPException(resp.status, f"Kimi error: {resp.status}")
+            
+            except asyncio.TimeoutError:
+                if attempt < max_retries - 1:
+                    logger.warning(f"Kimi query timeout, retry {attempt + 1}")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise
+            
+            except Exception as e:
+                logger.error(f"Kimi query failed: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise
         
-        return {"error": "Kimi Query fehlgeschlagen"}
+        return {"error": "Max retries exceeded"}

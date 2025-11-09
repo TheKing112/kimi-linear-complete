@@ -13,11 +13,13 @@ from datetime import datetime, timezone
 import asyncpg
 import numpy as np
 from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from sentence_transformers import SentenceTransformer
 import re
 import networkx as nx
 from asyncpg.exceptions import UniqueViolationError
+from fastapi.middleware.cors import CORSMiddleware
+import aiofiles
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -29,11 +31,26 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# ✅ NEU - CORS Middleware hinzufügen
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Pydantic Models
 class MemoryRequest(BaseModel):
-    user_id: str = Field(..., min_length=1)
-    content: str = Field(..., min_length=10)
+    user_id: str = Field(..., min_length=1, max_length=255)
+    content: str = Field(..., min_length=10, max_length=100000)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    
+    @validator('content')
+    def validate_content(cls, v):
+        if len(v.strip()) < 10:
+            raise ValueError('Content too short after stripping')
+        return v.strip()
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -86,8 +103,15 @@ async def init_database():
     if not db_url:
         raise ValueError("DATABASE_URL nicht gesetzt")
     
-    # Erstelle Connection Pool
-    db_pool = await asyncpg.create_pool(db_url, min_size=2, max_size=10)
+    # ✅ RICHTIG - Skalierbarer Connection Pool
+    db_pool = await asyncpg.create_pool(
+        db_url,
+        min_size=5,
+        max_size=50,
+        command_timeout=60,
+        max_queries=50000,
+        max_inactive_connection_lifetime=300
+    )
     
     # Erstelle Tabellen
     async with db_pool.acquire() as conn:
@@ -127,45 +151,47 @@ async def init_database():
         
         logger.info("Datenbank-Tabellen erstellt")
 
-async def extract_knowledge(content: str, user_id: str) -> None:
-    """Extrahiere Wissen aus Code für Knowledge Graph"""
+# ✅ NEU - Transaction-aware Version
+async def extract_knowledge_transactional(
+    conn: asyncpg.Connection,
+    content: str,
+    user_id: str
+) -> None:
+    """Extrahiere Wissen mit Transaction-Support"""
     try:
-        # Extrahiere Funktionen
         functions = re.findall(r'def (\w+)\s*\(', content)
-        
-        # Extrahiere Klassen
         classes = re.findall(r'class (\w+)', content)
-        
-        # Extrahiere Imports
         imports = re.findall(r'^(?:import|from)\s+(\w+)', content, re.MULTILINE)
         
-        if not db_pool:
-            return
+        # Batch Insert für Performance
+        knowledge_records = []
         
-        async with db_pool.acquire() as conn:
-            for func in functions:
-                await conn.execute("""
-                    INSERT INTO knowledge_graph (user_id, subject, predicate, object, confidence)
-                    VALUES ($1, $2, 'defines_function', $3, 0.9)
-                    ON CONFLICT DO NOTHING
-                """, user_id, f"user_{user_id}", func)
+        for func in functions:
+            knowledge_records.append(
+                (user_id, f"user_{user_id}", 'defines_function', func, 0.9)
+            )
+        
+        for cls in classes:
+            knowledge_records.append(
+                (user_id, f"user_{user_id}", 'defines_class', cls, 0.9)
+            )
+        
+        for imp in imports:
+            knowledge_records.append(
+                (user_id, f"user_{user_id}", 'imports_library', imp, 0.7)
+            )
+        
+        if knowledge_records:
+            await conn.executemany("""
+                INSERT INTO knowledge_graph 
+                (user_id, subject, predicate, object, confidence)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT DO NOTHING
+            """, knowledge_records)
             
-            for cls in classes:
-                await conn.execute("""
-                    INSERT INTO knowledge_graph (user_id, subject, predicate, object, confidence)
-                    VALUES ($1, $2, 'defines_class', $3, 0.9)
-                    ON CONFLICT DO NOTHING
-                """, user_id, f"user_{user_id}", cls)
-            
-            for imp in imports:
-                await conn.execute("""
-                    INSERT INTO knowledge_graph (user_id, subject, predicate, object, confidence)
-                    VALUES ($1, $2, 'imports_library', $3, 0.7)
-                    ON CONFLICT DO NOTHING
-                """, user_id, f"user_{user_id}", imp)
-                
     except Exception as e:
         logger.warning(f"Wissens-Extraktion fehlgeschlagen: {e}")
+        raise  # Re-raise für Transaction Rollback
 
 # API Endpoints
 @app.on_event("startup")
@@ -179,28 +205,30 @@ async def startup_event():
         logger.error(f"Startup fehlgeschlagen: {e}")
         raise
 
+# ✅ RICHTIG - Mit Transaction
 @app.post("/memory/store", status_code=201)
 async def store_memory(request: MemoryRequest):
-    """Speichere Memory in Datenbank"""
+    """Speichere Memory atomar mit Knowledge Graph"""
     try:
-        logger.info(f"Speichere Memory für User {request.user_id}")
-        
-        # Generiere Embedding
+        # Generiere Embedding außerhalb Transaction (kann lange dauern)
         embedding = generate_embedding(request.content)
         
-        # Speichere in DB
         async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                INSERT INTO memories (user_id, content, embedding, metadata)
-                VALUES ($1, $2, $3, $4)
-                RETURNING id, created_at
-            """, request.user_id, request.content, embedding, request.metadata)
-            
-            memory_id = row['id']
-            created_at = row['created_at']
-        
-        # Extrahiere Wissen
-        await extract_knowledge(request.content, request.user_id)
+            async with conn.transaction():  # ✅ Transaction
+                # Speichere Memory
+                row = await conn.fetchrow("""
+                    INSERT INTO memories (user_id, content, embedding, metadata)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id, created_at
+                """, request.user_id, request.content, embedding, request.metadata)
+                
+                memory_id = row['id']
+                created_at = row['created_at']
+                
+                # Extrahiere und speichere Knowledge im selben Transaction
+                await extract_knowledge_transactional(
+                    conn, request.content, request.user_id
+                )
         
         logger.info(f"Memory gespeichert (ID: {memory_id})")
         
@@ -209,10 +237,9 @@ async def store_memory(request: MemoryRequest):
             "memory_id": memory_id,
             "created_at": created_at.isoformat()
         }
-        
     except Exception as e:
         logger.error(f"Speichern fehlgeschlagen: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to store memory")
 
 @app.get("/memory/search")
 async def search_memory(query: str, user_id: Optional[str] = None, limit: int = 10):
@@ -261,18 +288,36 @@ async def search_memory(query: str, user_id: Optional[str] = None, limit: int = 
         logger.error(f"Suche fehlgeschlagen: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ✅ RICHTIG - Mit Pagination
 @app.get("/memory/user/{user_id}")
-async def get_user_memories(user_id: str, limit: int = 50):
-    """Hole alle Memories eines Users"""
+async def get_user_memories(
+    user_id: str,
+    limit: int = 50,
+    offset: int = 0,  # ✅ NEU
+    order_by: str = "created_at"  # ✅ NEU
+):
+    """Hole Memories mit Pagination"""
     try:
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            # Count total
+            total = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE user_id = $1",
+                user_id
+            )
+            
+            # Validate order_by to prevent SQL injection
+            allowed_columns = {"created_at", "updated_at", "id"}
+            if order_by not in allowed_columns:
+                order_by = "created_at"
+            
+            # Fetch page
+            rows = await conn.fetch(f"""
                 SELECT id, content, metadata, created_at
                 FROM memories
                 WHERE user_id = $1
-                ORDER BY created_at DESC
-                LIMIT $2
-            """, user_id, limit)
+                ORDER BY {order_by} DESC
+                LIMIT $2 OFFSET $3
+            """, user_id, limit, offset)
         
         memories = []
         for row in rows:
@@ -283,7 +328,16 @@ async def get_user_memories(user_id: str, limit: int = 50):
                 "created_at": row['created_at'].isoformat()
             })
         
-        return {"user_id": user_id, "memories": memories}
+        return {
+            "user_id": user_id,
+            "memories": memories,
+            "pagination": {  # ✅ NEU
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + limit < total
+            }
+        }
         
     except Exception as e:
         logger.error(f"Abrufen fehlgeschlagen: {e}")
@@ -337,9 +391,6 @@ async def get_knowledge_graph(user_id: str):
     except Exception as e:
         logger.error(f"Knowledge Graph fehlgeschlagen: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# File 1: services/cognee/src/main.py
-# Aktualisierter Health Endpoint mit einheitlichem Format
 
 @app.get("/health")
 async def health_check():

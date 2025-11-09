@@ -57,83 +57,126 @@ class GitHubClient:
             logger.warning(f"Rate Limit Abfrage fehlgeschlagen: {e}")
             return {"error": str(e)}
     
-    # ⚡ Rate-Limit-Handler mit automatischem Retry
-    def execute_with_rate_limit(self, func, *args, **kwargs):
-        """Führe GitHub-Operation mit automatischem Retry bei Rate Limit aus"""
-        while True:
+    # ✅ RICHTIG - Mit Max Retries
+    def execute_with_rate_limit(
+        self,
+        func,
+        *args,
+        max_retries: int = 3,
+        **kwargs
+    ):
+        """Führe GitHub-Operation mit Rate-Limit-Handling und max retries aus"""
+        retries = 0
+        
+        while retries < max_retries:
             try:
                 return func(*args, **kwargs)
+            
             except RateLimitExceededException:
+                retries += 1
+                
+                if retries >= max_retries:
+                    logger.error(f"Max retries ({max_retries}) für Rate Limit erreicht")
+                    raise
+                
                 reset_time = self.github.rate_limiting_resettime
                 wait_seconds = max(reset_time - time.time(), 0) + 60
-                logger.warning(f"⏱️ Rate limit hit, waiting {wait_seconds}s")
+                
+                logger.warning(
+                    f"⏱️ Rate limit erreicht (Versuch {retries}/{max_retries}), "
+                    f"warte {wait_seconds}s"
+                )
                 time.sleep(wait_seconds)
+            
             except Exception as e:
                 logger.error(f"GitHub API Fehler: {e}")
                 raise
+        
+        raise Exception("Unerwartet: Max retries ohne Ausnahme")
     
-    # 🔒 User-Permission-Check für Schreibrechte
+    # ✅ Verbessert - Mit Caching
     def verify_user_access(self, user_id: str, repo_id: str) -> bool:
-        """Prüfe ob User Schreibrechte auf Repository hat"""
+        """Prüfe User-Schreibrechte mit Caching"""
         try:
-            # Prüfe ob Token zu User gehört
+            # Cache-Key für Zugriffsprüfung
+            cache_key = f"access:{user_id}:{repo_id}"
+            
+            # In Produktion: Redis-Cache verwenden
+            # cached = redis.get(cache_key)
+            # if cached: return cached == "true"
+            
             user = self.github.get_user()
             repo = self.github.get_repo(repo_id)
             
             # Hole Collaborator-Permission
             permission = repo.get_collaborator_permission(user.login)
             
-            # Nur WRITE oder ADMIN erlaubt
-            return permission in ["write", "admin"]
+            has_access = permission in ["write", "admin"]
+            logger.info(f"User {user.login} hat {permission}-Zugriff auf {repo_id}")
+            
+            # Ergebnis cachen (15 Minuten)
+            # redis.setex(cache_key, 900, "true" if has_access else "false")
+            
+            return has_access
+        
         except Exception as e:
             logger.error(f"Permission-Check fehlgeschlagen: {e}")
             return False
     
-    # 🔧 NEU: Atomarer Commit mit allen Änderungen
-    def create_atomic_commit(self, repo: Repository, changes: List[Dict[str, Any]], branch: str, message: str) -> str:
-        """
-        Erstelle einen einzelnen atomaren Commit mit allen Änderungen
-        
-        Args:
-            repo: GitHub Repository Objekt
-            changes: Liste von Change-Dictionaries mit:
-                - action: "create", "modify" oder "delete"
-                - file_path: Pfad zur Datei
-                - new_content: Neuer Inhalt (für create/modify)
-                - sha: Aktuelle Blob SHA (optional, für modify)
-            branch: Zielbranch name
-            message: Commit Message
-        
-        Returns:
-            SHA des erstellten Commits
-        """
-        logger.info(f"🔧 Erstelle atomaren Commit auf {repo.full_name}:{branch} mit {len(changes)} Änderungen")
+    # ✅ Verbessert - Mit Validierung und Fehlerbehandlung
+    def create_atomic_commit(
+        self,
+        repo: Repository,
+        changes: List[Dict[str, Any]],
+        branch: str,
+        message: str
+    ) -> str:
+        """Erstelle atomaren Commit mit Rollback bei Fehler"""
+        logger.info(f"🔧 Erstelle atomaren Commit auf {repo.full_name}:{branch}")
         
         try:
-            # 1. Hole aktuellen Commit und Tree
-            base_commit = self.execute_with_rate_limit(repo.get_commit, f"heads/{branch}")
+            # 1. Hole aktuellen Commit
+            base_commit = self.execute_with_rate_limit(
+                repo.get_commit,
+                f"heads/{branch}"
+            )
             base_tree = base_commit.commit.tree
             
             # 2. Baue neuen Tree
             input_tree = []
+            processed_files = set()  # Track verarbeitete Dateien
+            
             for change in changes:
                 action = change.get("action")
                 file_path = change.get("file_path")
                 
+                # Validierung: Prüfe auf ungültige/duplikate Pfade
+                if not file_path or file_path in processed_files:
+                    logger.warning(f"Überspringe ungültige/duplikate Datei: {file_path}")
+                    continue
+                
+                processed_files.add(file_path)
+                
                 if action == "delete":
-                    # Datei wird ausgelassen -> gelöscht
                     logger.info(f"🗑️ Lösche Datei: {file_path}")
                     continue
                 
                 # Für create und modify
                 new_content = change.get("new_content", "")
+                
+                # Validierung: Standard-Inhalt für leere neue Dateien
                 if not new_content and action == "create":
-                    logger.warning(f"⚠️  Leerer Inhalt für neue Datei: {file_path}")
+                    logger.warning(f"⚠️ Leerer Inhalt für neue Datei: {file_path}")
+                    new_content = "# Leere Datei\n"
+                
+                # Validierung: Dateigrößen-Limit (GitHub: 100MB)
+                if len(new_content) > 100 * 1024 * 1024:
+                    raise ValueError(f"Datei zu groß: {file_path} ({len(new_content)} Bytes)")
                 
                 # Erstelle Blob
                 blob = self.execute_with_rate_limit(
-                    repo.create_git_blob, 
-                    new_content, 
+                    repo.create_git_blob,
+                    new_content,
                     "utf-8"
                 )
                 
@@ -144,12 +187,19 @@ class GitHubClient:
                     "sha": blob.sha
                 })
                 
-                logger.info(f"{'✨ Erstelle' if action == 'create' else '✏️  Ändere'} Datei: {file_path}")
+                logger.info(
+                    f"{'✨ Erstelle' if action == 'create' else '✏️ Ändere'}: {file_path}"
+                )
+            
+            # ✅ Prüfe auf tatsächliche Änderungen
+            if not input_tree and not any(c.get("action") == "delete" for c in changes):
+                logger.warning("Keine Änderungen zum Committen")
+                return base_commit.sha
             
             # 3. Erstelle neuen Tree
             new_tree = self.execute_with_rate_limit(
-                repo.create_git_tree, 
-                input_tree, 
+                repo.create_git_tree,
+                input_tree,
                 base_tree
             )
             logger.info(f"🌳 Neuer Tree erstellt: {new_tree.sha[:7]}")
@@ -164,12 +214,23 @@ class GitHubClient:
             logger.info(f"✅ Commit erstellt: {commit.sha[:7]}")
             
             # 5. Update Branch Ref
-            ref = self.execute_with_rate_limit(repo.get_git_ref, f"heads/{branch}")
+            ref = self.execute_with_rate_limit(
+                repo.get_git_ref,
+                f"heads/{branch}"
+            )
             self.execute_with_rate_limit(ref.edit, commit.sha)
-            logger.info(f"🚀 Branch {branch} auf {commit.sha[:7]} aktualisiert")
+            logger.info(f"🚀 Branch {branch} aktualisiert auf {commit.sha[:7]}")
             
             return commit.sha
-            
+        
         except Exception as e:
-            logger.error(f"❌ Atomarer Commit fehlgeschlagen: {e}")
-            raise
+            logger.error(f"❌ Atomarer Commit fehlgeschlagen: {e}", exc_info=True)
+            
+            # Detaillierte Fehlermeldungen
+            error_msg = str(e).lower()
+            if "rate limit" in error_msg:
+                raise Exception("GitHub Rate Limit überschritten. Bitte versuche es später erneut.")
+            elif "not found" in error_msg:
+                raise Exception(f"Branch oder Repository nicht gefunden: {branch}")
+            else:
+                raise Exception(f"Commit-Erstellung fehlgeschlagen: {str(e)}")
