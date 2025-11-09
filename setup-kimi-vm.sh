@@ -6,6 +6,25 @@
 
 set -euo pipefail
 
+# ===== TRAP & CLEANUP =====
+trap cleanup_on_interrupt INT TERM
+
+cleanup_on_interrupt() {
+    warn "\n\n⚠️  Setup wurde abgebrochen!"
+    
+    read -p "VM löschen? [y/N] " -r
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        log "Lösche VM..."
+        gcloud compute instances delete "$VM_NAME" --quiet --zone=us-east1-b 2>/dev/null || true
+        ok "VM gelöscht"
+    else
+        warn "VM wurde erstellt, aber Setup unvollständig"
+        warn "Manuell löschen mit: gcloud compute instances delete $VM_NAME"
+    fi
+    
+    exit 130
+}
+
 # ===== CONFIGURATION =====
 readonly VM_NAME="kimi-linear-auto"
 readonly VM_TYPE="g2-standard-8"
@@ -44,24 +63,47 @@ check_git() {
 
 # ===== VM CREATION =====
 find_available_zone() {
-    log "Suche verfügbare GPU-Kapazität..."
-    for zone in "${ZONES[@]}"; do
-        if gcloud compute instances create "$VM_NAME" \
-            --zone="$zone" \
-            --machine-type="$VM_TYPE" \
-            --accelerator="type=$GPU_TYPE,count=1" \
-            --image-family="ubuntu-2204-lts" \
-            --image-project="ubuntu-os-cloud" \
-            --boot-disk-size="$DISK_SIZE" \
-            --boot-disk-type="pd-ssd" \
-            --maintenance-policy="TERMINATE" \
-            --scopes="cloud-platform" \
-            --tags="ai-workstation" \
-            --dry-run &>/dev/null; then
-            echo "$zone"
-            return 0
+    log "Suche verfügbare GPU-Kapazität in ${#ZONES[@]} Zonen..."
+    
+    local attempt=1
+    local max_attempts=2
+    
+    while [ $attempt -le $max_attempts ]; do
+        log "Versuch $attempt von $max_attempts..."
+        
+        for zone in "${ZONES[@]}"; do
+            log "  Prüfe Zone: $zone"
+            
+            # Check quota first
+            if ! gcloud compute project-info describe \
+                --format="value(quotas.filter(metric:GPUS))" 2>/dev/null | grep -q "GPUS"; then
+                warn "  GPU quota check failed for $zone"
+                continue
+            fi
+            
+            # Try dry-run
+            if gcloud compute instances create "$VM_NAME-test" \
+                --zone="$zone" \
+                --machine-type="$VM_TYPE" \
+                --accelerator="type=$GPU_TYPE,count=1" \
+                --dry-run &>/dev/null; then
+                ok "  Verfügbar: $zone"
+                echo "$zone"
+                return 0
+            else
+                warn "  Nicht verfügbar: $zone"
+            fi
+        done
+        
+        if [ $attempt -lt $max_attempts ]; then
+            log "Keine Zone verfügbar, warte 30s vor erneutem Versuch..."
+            sleep 30
         fi
+        
+        ((attempt++))
     done
+    
+    error "Keine GPU-Kapazität in allen Zonen nach $max_attempts Versuchen"
     return 1
 }
 
@@ -87,6 +129,52 @@ create_vm() {
     
     ok "VM erstellt: $VM_NAME in $zone"
     echo "$zone"
+}
+
+# ===== FIREWALL SETUP =====
+setup_firewall_rules() {
+    local zone="$1"
+    log "Konfiguriere Firewall-Regeln..."
+    
+    # Check if firewall rules exist
+    local rules=("allow-http" "allow-https" "allow-ssh" "allow-custom-ports")
+    
+    for rule in "${rules[@]}"; do
+        if ! gcloud compute firewall-rules describe "kimi-$rule" &>/dev/null; then
+            log "Erstelle Firewall-Regel: kimi-$rule"
+            
+            case "$rule" in
+                allow-http)
+                    gcloud compute firewall-rules create "kimi-$rule" \
+                        --allow=tcp:80 \
+                        --target-tags=ai-workstation \
+                        --description="Allow HTTP traffic"
+                    ;;
+                allow-https)
+                    gcloud compute firewall-rules create "kimi-$rule" \
+                        --allow=tcp:443 \
+                        --target-tags=ai-workstation \
+                        --description="Allow HTTPS traffic"
+                    ;;
+                allow-ssh)
+                    gcloud compute firewall-rules create "kimi-$rule" \
+                        --allow=tcp:22 \
+                        --target-tags=ai-workstation \
+                        --description="Allow SSH access"
+                    ;;
+                allow-custom-ports)
+                    gcloud compute firewall-rules create "kimi-$rule" \
+                        --allow=tcp:3000,tcp:8001-8004,tcp:9090 \
+                        --target-tags=ai-workstation \
+                        --description="Allow Kimi services"
+                    ;;
+            esac
+        else
+            log "Firewall-Regel existiert bereits: kimi-$rule"
+        fi
+    done
+    
+    ok "Firewall-Regeln konfiguriert"
 }
 
 # ===== SSH SETUP =====
@@ -183,6 +271,27 @@ show_completion_info() {
 EOF
 }
 
+show_cost_estimate() {
+    cat << EOF
+
+╔════════════════════════════════════════════════════════════════════╗
+║  💰 GESCHÄTZTE KOSTEN                                              ║
+╚════════════════════════════════════════════════════════════════════╝
+
+  • VM (g2-standard-8):     ~\$0.90/Stunde
+  • GPU (NVIDIA L4):         ~\$0.75/Stunde
+  • Disk (400GB SSD):        ~\$0.17/Tag
+  
+  📊 Gesamt:                  ~\$1.65/Stunde  oder  ~\$1,200/Monat
+  
+  ⚠️  Diese Schätzung gilt bei 100% Auslastung!
+  
+  💡 TIPP: Stoppe VM wenn nicht verwendet:
+     gcloud compute instances stop $VM_NAME --zone=<zone>
+
+EOF
+}
+
 # ===== CLEANUP =====
 cleanup_existing_vm() {
     if gcloud compute instances describe "$VM_NAME" --zone=us-east1-b &>/dev/null 2>&1; then
@@ -221,8 +330,10 @@ EOF
     
     local zone
     zone=$(create_vm)
+    setup_firewall_rules "$zone"
     setup_ssh_access "$zone"
     wait_for_setup_completion "$zone"
+    show_cost_estimate
     show_completion_info "$zone"
     
     log "✨ Fertig! Deine KI-Coding-Engine läuft auf der VM"

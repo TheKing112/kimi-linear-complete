@@ -14,11 +14,15 @@ import json
 import asyncpg
 import asyncio
 import signal
+import gc  # NEU: Für garbage collection
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+# NEU: Für Concurrency Control
+from asyncio import Semaphore
 
 # Logging
 logging.basicConfig(
@@ -33,7 +37,11 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# ✅ NEU - Nach app Definition
+# NEU - Concurrency Control
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
+request_semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
+
+# NEU - Signal Handler (nach app Definition)
 def signal_handler(signum, frame):
     """Handle shutdown signals"""
     logger.info(f"Received signal {signum}, shutting down gracefully...")
@@ -49,6 +57,30 @@ def signal_handler(signum, frame):
 # Register handlers
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
+
+# NEU - Cleanup Funktion
+def cleanup_model():
+    """Cleanup model and free GPU memory"""
+    global model, tokenizer
+    
+    if model is not None:
+        try:
+            # Clear model from memory
+            del model
+            model = None
+            
+            # Clear CUDA cache
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                
+            logger.info("Model cleaned up successfully")
+        except Exception as e:
+            logger.error(f"Error during model cleanup: {e}")
+    
+    if tokenizer is not None:
+        del tokenizer
+        tokenizer = None
 
 # Pydantic Models
 class ChatMessage(BaseModel):
@@ -80,7 +112,7 @@ model: Optional[torch.nn.Module] = None
 tokenizer: Optional[AutoTokenizer] = None
 model_config: Dict[str, Any] = {}
 
-# ✅ NEU - Memory Monitoring
+# NEU - Memory Monitoring
 def check_memory_available(required_gb: float = 2.0) -> bool:
     """Check if enough memory available"""
     if torch.cuda.is_available():
@@ -173,6 +205,30 @@ def load_model():
         logger.error(f"Error loading model: {e}")
         raise
 
+# NEU - Nach load_model() Funktion
+def validate_model_loaded():
+    """Validate model is properly loaded"""
+    if model is None:
+        raise RuntimeError("Model not loaded")
+    
+    if tokenizer is None:
+        raise RuntimeError("Tokenizer not loaded")
+    
+    # Test inference
+    try:
+        test_input = tokenizer("Test", return_tensors="pt")
+        test_input = {k: v.to(model.device) for k, v in test_input.items()}
+        
+        with torch.no_grad():
+            _ = model.generate(**test_input, max_new_tokens=1)
+        
+        logger.info("Model validation successful")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Model validation failed: {e}")
+        raise RuntimeError(f"Model validation failed: {e}")
+
 def build_prompt(request: GenerateRequest) -> str:
     """Build final prompt from request"""
     if request.messages:
@@ -246,23 +302,69 @@ async def store_generation_metadata(memory_id: int, metadata: Dict[str, Any]):
     except Exception as e:
         logger.warning(f"Failed to store generation metadata: {e}")
 
+# NEU - Startup Event mit Validierung
 @app.on_event("startup")
 async def startup_event():
-    """Startup: Load model"""
+    """Startup: Load and validate model"""
     try:
         load_model()
-        logger.info("✅ Model loaded successfully")
+        validate_model_loaded()  # NEU: Model validieren
+        logger.info("✅ Model loaded and validated successfully")
     except Exception as e:
-        logger.error(f"❌ CRITICAL: Model loading failed: {e}", exc_info=True)
+        logger.error(f"❌ CRITICAL: Model loading/validation failed: {e}", exc_info=True)
         # ✅ Exit mit Error Code
         import sys
         sys.exit(1)
 
+# NEU - Shutdown Event
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    logger.info("Shutting down Kimi Linear API...")
+    
+    # Cleanup model
+    cleanup_model()
+    
+    # Final garbage collection
+    gc.collect()
+    
+    logger.info("Shutdown complete")
+
+# NEU - Generate Endpoint mit Validierung und Concurrency Control
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
-    """Generate with timeout"""
+    """Generate with validation and concurrency limit"""
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    # ✅ NEU - Input validation
+    if request.prompt:
+        if len(request.prompt) > 50000:  # ~50K chars = ~12K tokens
+            raise HTTPException(
+                status_code=400,
+                detail="Prompt too long (max 50K characters)"
+            )
+    
+    if request.messages:
+        total_length = sum(len(m.content) for m in request.messages)
+        if total_length > 50000:
+            raise HTTPException(
+                status_code=400,
+                detail="Combined messages too long (max 50K characters)"
+            )
+        
+        if len(request.messages) > 100:
+            raise HTTPException(
+                status_code=400,
+                detail="Too many messages (max 100)"
+            )
+    
+    # Validate temperature range
+    if not 0.0 <= request.temperature <= 2.0:
+        raise HTTPException(
+            status_code=400,
+            detail="Temperature must be between 0.0 and 2.0"
+        )
     
     # ✅ NEU - Memory Check
     if not check_memory_available(required_gb=1.5):
@@ -271,81 +373,116 @@ async def generate(request: GenerateRequest):
             detail="Insufficient GPU memory. Please try again later."
         )
     
-    try:
-        # ✅ NEU - Mit Timeout
-        result = await asyncio.wait_for(
-            generate_internal(request),
-            timeout=300.0  # 5 Minuten max
-        )
-        return result
-    
-    except asyncio.TimeoutError:
+    # ✅ NEU - Concurrency Control
+    if request_semaphore.locked():
         raise HTTPException(
-            status_code=504,
-            detail="Generation timeout (5 minutes)"
-        )
-    except Exception as e:
-        logger.error(f"Generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def generate_internal(request: GenerateRequest) -> GenerateResponse:
-    """Internal generation logic"""
-    start_time = time.time()
-    
-    # Prepare input
-    prompt = build_prompt(request)
-    inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    
-    input_length = inputs["input_ids"].shape[1]
-    
-    # Generate
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=True
+            status_code=503,
+            detail=f"Server busy. Max {MAX_CONCURRENT_REQUESTS} concurrent requests allowed."
         )
     
-    # Decode only new tokens
-    generated_tokens = outputs[0][input_length:]
-    generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-    
-    generation_time = (time.time() - start_time) * 1000
-    
-    # Prepare response
-    response = GenerateResponse(
-        text=generated_text,
-        tokens_used=len(generated_tokens),
-        model=model_config["model_name"],
-        generation_time_ms=generation_time,
-        memory_id=None  # Will be set if stored
-    )
-    
-    # Store extended metadata if requested
-    if request.store_metadata:
-        meta = {
-            "prompt_text": prompt[:500],  # Truncate for storage
-            "prompt_tokens": input_length,
-            "generated_tokens": len(generated_tokens),
-            "total_tokens": input_length + len(generated_tokens),
-            "generation_time_ms": generation_time,
-            "temperature": request.temperature,
-            "top_p": request.top_p,
-            "model_name": model_config["model_name"],
-            "model_version": "1.0.0",
-            "gpu_device": str(model.device)
-        }
+    async with request_semaphore:
+        try:
+            # ✅ NEU - Mit Timeout
+            result = await asyncio.wait_for(
+                generate_internal(request),
+                timeout=300.0  # 5 Minuten max
+            )
+            return result
         
-        # Note: In production, you'd want to store this asynchronously
-        # and return the memory_id in the response
-    
-    return response
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Generation timeout (5 minutes)"
+            )
+        except Exception as e:
+            logger.error(f"Generation error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+# NEU - Generate Internal mit OOM Recovery
+async def generate_internal(request: GenerateRequest) -> GenerateResponse:
+    """Internal generation logic with OOM recovery"""
+    try:
+        start_time = time.time()
+        
+        # Prepare input
+        prompt = build_prompt(request)
+        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        
+        input_length = inputs["input_ids"].shape[1]
+        
+        # Generate
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=True
+            )
+        
+        # Decode only new tokens
+        generated_tokens = outputs[0][input_length:]
+        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        
+        generation_time = (time.time() - start_time) * 1000
+        
+        # Prepare response
+        response = GenerateResponse(
+            text=generated_text,
+            tokens_used=len(generated_tokens),
+            model=model_config["model_name"],
+            generation_time_ms=generation_time,
+            memory_id=None  # Will be set if stored
+        )
+        
+        # Store extended metadata if requested
+        if request.store_metadata:
+            meta = {
+                "prompt_text": prompt[:500],  # Truncate for storage
+                "prompt_tokens": input_length,
+                "generated_tokens": len(generated_tokens),
+                "total_tokens": input_length + len(generated_tokens),
+                "generation_time_ms": generation_time,
+                "temperature": request.temperature,
+                "top_p": request.top_p,
+                "model_name": model_config["model_name"],
+                "model_version": "1.0.0",
+                "gpu_device": str(model.device)
+            }
+            
+            # Note: In production, you'd want to store this asynchronously
+            # and return the memory_id in the response
+        
+        return response
+        
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            logger.error("CUDA OOM detected, attempting recovery...")
+            
+            # Clear cache
+            torch.cuda.empty_cache()
+            
+            # Try with reduced batch size / tokens
+            if request.max_tokens > 512:
+                logger.warning(f"Reducing max_tokens from {request.max_tokens} to 512")
+                request.max_tokens = 512
+                
+                # Retry once
+                return await generate_internal(request)
+            else:
+                raise HTTPException(
+                    status_code=503,
+                    detail="GPU out of memory. Please reduce input size or try again later."
+                )
+        else:
+            raise
+    except Exception as e:
+        logger.error(f"Generation error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():

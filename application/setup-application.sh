@@ -11,7 +11,7 @@ readonly LOG_FILE="/tmp/application-setup.log"
 log() { echo "[$(date +%T)] $1" | tee -a "$LOG_FILE"; }
 ok()  { echo "✓ $1" | tee -a "$LOG_FILE"; }
 error() { echo "✗ $1" | tee -a "$LOG_FILE"; exit 1; }
-warn() { echo "⚠ $1" | tee -a "$LOG_FILE"; }  # NEW: Warning helper
+warn() { echo "⚠ $1" | tee -a "$LOG_FILE"; }
 
 # ==================================== CONFIGURATION ====================================
 
@@ -37,7 +37,16 @@ create_directories() {
 create_env_file() {
     if [[ -f .env ]]; then
         log "Backing up existing .env..."
-        cp .env .env.backup.$(date +%s)
+        backup_name=".env.backup.$(date +%s)"
+        cp .env "$backup_name"
+        ok "Backup created: $backup_name"
+        
+        # ✅ NEU - Frage ob überschreiben
+        read -p "Overwrite existing .env? [y/N] " -r
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log "Keeping existing .env"
+            return 0
+        fi
     fi
     
     log "Creating comprehensive .env file..."
@@ -133,7 +142,6 @@ EOF
     ok "Created .env with all variables (PLEASE EDIT TOKENS!)"
 }
 
-# ✅ NEU - Nach create_env_file()
 validate_env_file() {
     log "Validating .env file..."
     
@@ -572,9 +580,19 @@ EOF
     ok "Created helper scripts"
 }
 
-# ✅ NEU - Nach main()
 preflight_checks() {
     log "Running preflight checks..."
+    
+    # ✅ NEU - Check write permissions
+    if [ ! -w . ]; then
+        error "No write permission in current directory"
+    fi
+    
+    # ✅ NEU - Check if running as root (not recommended)
+    if [ "$EUID" -eq 0 ]; then
+        warn "Running as root is not recommended"
+        warn "Consider using a non-root user"
+    fi
     
     # Check Docker
     if ! command -v docker &>/dev/null; then
@@ -609,6 +627,35 @@ preflight_checks() {
     ok "Preflight checks complete"
 }
 
+# ✅ NEU - Nach preflight_checks() Definition
+check_dependencies() {
+    log "Checking dependencies..."
+    
+    local missing_deps=()
+    
+    # Check Docker Compose (V1 or V2)
+    if ! command -v docker-compose &>/dev/null && \
+       ! docker compose version &>/dev/null 2>&1; then
+        missing_deps+=("docker-compose")
+    fi
+    
+    # Check openssl for password generation
+    if ! command -v openssl &>/dev/null; then
+        missing_deps+=("openssl")
+    fi
+    
+    # Check curl for health checks
+    if ! command -v curl &>/dev/null; then
+        missing_deps+=("curl")
+    fi
+    
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        error "Missing dependencies: ${missing_deps[*]}"
+    fi
+    
+    ok "All dependencies present"
+}
+
 # ==================================== MAIN ====================================
 
 main() {
@@ -621,6 +668,7 @@ main() {
 ╚══════════════════════════════════════════════════════════════════════════════╝
 EOF
     
+    check_dependencies  # ✅ NEU: Run dependency checks first
     preflight_checks  # NEW: Run checks first
     
     create_directories
@@ -629,6 +677,8 @@ EOF
     create_init_scripts
     create_docker_compose
     create_helper_scripts
+    
+    validate_setup  # ✅ NEU: Validate the complete setup
     
     log ""
     ok "╔══════════════════════════════════════════════════════════════════════════════╗"
@@ -647,6 +697,42 @@ EOF
     ok "║  • Cognee API:     http://localhost:8001/docs                               ║"
     ok "║  • GitHub API:     http://localhost:8004/docs                               ║"
     ok "╚══════════════════════════════════════════════════════════════════════════════╝"
+}
+
+# ✅ NEU - Neue Funktion nach main()
+validate_setup() {
+    log "Validating setup..."
+    
+    # Check if all required files exist
+    local required_files=(
+        ".env"
+        "docker-compose.yml"
+        "start.sh"
+        "stop.sh"
+        "status.sh"
+        "init-scripts/01-init.sql"
+    )
+    
+    for file in "${required_files[@]}"; do
+        if [ ! -f "$file" ]; then
+            error "Missing file: $file"
+        fi
+    done
+    
+    # Check if scripts are executable
+    local scripts=("start.sh" "stop.sh" "status.sh" "logs.sh")
+    for script in "${scripts[@]}"; do
+        if [ ! -x "$script" ]; then
+            error "Script not executable: $script"
+        fi
+    done
+    
+    # Check .env syntax
+    if ! grep -q "^DISCORD_BOT_TOKEN=" .env; then
+        error ".env missing required variable: DISCORD_BOT_TOKEN"
+    fi
+    
+    ok "Setup validation passed"
 }
 
 main "$@" 2>&1 | tee "$LOG_FILE"

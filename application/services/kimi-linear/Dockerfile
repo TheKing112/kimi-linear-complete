@@ -18,7 +18,7 @@ ENV TZ=Europe/Berlin \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     PYTHONUNBUFFERED=1
 
-# System-Pakete
+# System-Pakete (curl für Healthcheck muss installiert sein)
 RUN apt-get update && apt-get install -y \
     git git-lfs curl wget build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -41,8 +41,16 @@ RUN mkdir -p ${MODEL_PATH}
 # Modell herunterladen
 RUN bash download-model.sh
 
-# ✅ Healthcheck verbessert
-HEALTHCHECK --interval=60s --timeout=30s --start-period=1200s --retries=5 \
+# ✅ NEU - Nach pip install
+# Compile Python files
+RUN python -m compileall -q /app/src
+
+# Pre-download common models/data
+RUN python -c "from transformers import AutoTokenizer; \
+    AutoTokenizer.from_pretrained('bert-base-uncased')" || true
+
+# ✅ Healthcheck verbessert (kürzere Start-Periode)
+HEALTHCHECK --interval=60s --timeout=30s --start-period=600s --retries=5 \
     CMD curl -f http://localhost:8003/health || exit 1
 
 ENTRYPOINT ["python", "-m", "uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "8003", "--workers", "1"]

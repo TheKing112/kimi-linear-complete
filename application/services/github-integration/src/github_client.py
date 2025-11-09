@@ -1,5 +1,6 @@
 import os
 import time
+import re
 from github import Github, Repository, GithubException, RateLimitExceededException
 from git import Repo
 import tempfile
@@ -57,16 +58,18 @@ class GitHubClient:
             logger.warning(f"Rate Limit Abfrage fehlgeschlagen: {e}")
             return {"error": str(e)}
     
-    # ✅ RICHTIG - Mit Max Retries
+    # ✅ RICHTIG - Mit Max Retries und Timeout
     def execute_with_rate_limit(
         self,
         func,
         *args,
         max_retries: int = 3,
+        max_wait: int = 3600,  # NEU - Max 1 Stunde warten
         **kwargs
     ):
         """Führe GitHub-Operation mit Rate-Limit-Handling und max retries aus"""
         retries = 0
+        total_wait = 0  # NEU - Wartezeit tracking
         
         while retries < max_retries:
             try:
@@ -77,16 +80,22 @@ class GitHubClient:
                 
                 if retries >= max_retries:
                     logger.error(f"Max retries ({max_retries}) für Rate Limit erreicht")
-                    raise
+                    raise Exception(f"Max retries ({max_retries}) exceeded")
                 
                 reset_time = self.github.rate_limiting_resettime
                 wait_seconds = max(reset_time - time.time(), 0) + 60
+                
+                # NEU - Check max wait
+                if total_wait + wait_seconds > max_wait:
+                    raise Exception(f"Max wait time ({max_wait}s) exceeded")
                 
                 logger.warning(
                     f"⏱️ Rate limit erreicht (Versuch {retries}/{max_retries}), "
                     f"warte {wait_seconds}s"
                 )
+                
                 time.sleep(wait_seconds)
+                total_wait += wait_seconds  # NEU - Update total wait
             
             except Exception as e:
                 logger.error(f"GitHub API Fehler: {e}")
@@ -132,6 +141,24 @@ class GitHubClient:
         message: str
     ) -> str:
         """Erstelle atomaren Commit mit Rollback bei Fehler"""
+        
+        # ✅ NEU - Input Validierung
+        if not changes:
+            raise ValueError("Keine Änderungen bereitgestellt")
+        
+        if len(message) > 500:
+            raise ValueError("Commit-Nachricht zu lang (max. 500 Zeichen)")
+        
+        # Validate branch name
+        if not re.match(r'^[a-zA-Z0-9/_-]+$', branch):
+            raise ValueError(f"Ungültiger Branch-Name: {branch}")
+        
+        # Check if branch exists
+        try:
+            repo.get_branch(branch)
+        except Exception:
+            raise ValueError(f"Branch existiert nicht: {branch}")
+        
         logger.info(f"🔧 Erstelle atomaren Commit auf {repo.full_name}:{branch}")
         
         try:
@@ -169,9 +196,16 @@ class GitHubClient:
                     logger.warning(f"⚠️ Leerer Inhalt für neue Datei: {file_path}")
                     new_content = "# Leere Datei\n"
                 
-                # Validierung: Dateigrößen-Limit (GitHub: 100MB)
-                if len(new_content) > 100 * 1024 * 1024:
-                    raise ValueError(f"Datei zu groß: {file_path} ({len(new_content)} Bytes)")
+                # ✅ NEU - Chunked Upload für große Dateien
+                MAX_BLOB_SIZE = 10 * 1024 * 1024  # 10MB
+                if len(new_content) > MAX_BLOB_SIZE:
+                    logger.warning(f"Große Datei erkannt: {file_path} ({len(new_content)} bytes)")
+                    
+                    # Für sehr große Dateien: Git LFS verwenden
+                    raise ValueError(
+                        f"Datei zu groß für direkten Commit: {file_path} "
+                        f"({len(new_content)} bytes). Bitte Git LFS verwenden."
+                    )
                 
                 # Erstelle Blob
                 blob = self.execute_with_rate_limit(

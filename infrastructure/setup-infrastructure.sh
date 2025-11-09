@@ -1,10 +1,31 @@
 #!/bin/bash
 # =============================================================================
-# KIMI LINEAR 48B - INFRASTRUCTURE SETUP (SPARSE ACTIVATION)
+# KIMI LINEAR 48B - INFRASTRUCTUR SETUP (SPARSE ACTIVATION)
 # 48B Parameter, aber nur 3B aktiv pro Forward-Pass!
 # =============================================================================
 
 set -euo pipefail
+trap cleanup_on_error ERR
+
+cleanup_on_error() {
+    local exit_code=$?
+    error "Setup failed with exit code: $exit_code"
+    error "Check log file: $LOG_FILE"
+    
+    # Attempt rollback
+    log "Attempting rollback..."
+    
+    # Remove partial installations
+    if [ -f /tmp/setup-in-progress ]; then
+        apt-get autoremove -y || true
+        apt-get autoclean || true
+    fi
+    
+    exit $exit_code
+}
+
+# Mark setup in progress
+touch /tmp/setup-in-progress
 
 # ==================================== KONFIGURATION ====================================
 
@@ -118,6 +139,16 @@ install_cuda() {
         return 0
     fi
 
+    # Check CUDA compatibility
+    local driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+    local min_driver="525.60.13"  # Min for CUDA 12.1
+    
+    if [[ "$(printf '%s\n' "$min_driver" "$driver_version" | sort -V | head -n1)" != "$min_driver" ]]; then
+        error "NVIDIA driver too old. Need >= $min_driver, have $driver_version"
+    fi
+    
+    log "Driver version OK: $driver_version"
+    
     local vram_status=$(check_vram)
     if [[ "$vram_status" == "insufficient" ]]; then
         warn "WARNUNG: Weniger als ${MIN_VRAM_GB}GB VRAM verfügbar!"
@@ -150,8 +181,30 @@ install_cuda() {
 install_ml_packages() {
     log "Installiere Python ML Stack mit kompatiblen Versionen..."
     
-    python3 -m venv ~/.venv/kimi-linear
-    source ~/.venv/kimi-linear/bin/activate
+    # Check disk space before installing packages
+    REQUIRED_SPACE_GB=20
+    available_space=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//')
+    
+    if [ "$available_space" -lt "$REQUIRED_SPACE_GB" ]; then
+        error "Insufficient disk space. Need ${REQUIRED_SPACE_GB}GB, have ${available_space}GB"
+    fi
+    
+    # Create venv if not exists
+    if [ ! -d ~/.venv/kimi-linear ]; then
+        python3 -m venv ~/.venv/kimi-linear
+    fi
+    
+    # Activate venv
+    source ~/.venv/kimi-linear/bin/activate || {
+        error "Failed to activate virtual environment"
+    }
+    
+    # Verify we're in venv
+    if [[ "$VIRTUAL_ENV" != *"kimi-linear"* ]]; then
+        error "Virtual environment not activated correctly"
+    fi
+    
+    log "Virtual environment active: $VIRTUAL_ENV"
     
     pip install --no-cache-dir torch==2.2.2 --index-url https://download.pytorch.org/whl/cu121
     
@@ -172,6 +225,15 @@ install_ml_packages() {
         pydantic==2.10.0
     
     pip install --no-cache-dir psutil==5.9.8
+    
+    # Add to bashrc for persistence
+    if ! grep -q "kimi-linear/bin/activate" ~/.bashrc; then
+        echo "" >> ~/.bashrc
+        echo "# Kimi Linear Python Environment" >> ~/.bashrc
+        echo "alias kimi-env='source ~/.venv/kimi-linear/bin/activate'" >> ~/.bashrc
+    fi
+    
+    deactivate
     
     ok "ML Stack mit kompatiblen Versionen installiert"
 }
@@ -212,6 +274,9 @@ main() {
     install_ml_packages
     create_directories
     test_environment
+    
+    # Remove setup marker on success
+    rm -f /tmp/setup-in-progress
     
     log "════════════════════════════════════════════════════════════"
     log "  INFRASTRUKTUR BEREIT! Nur ${MIN_VRAM_GB}GB VRAM erforderlich!"

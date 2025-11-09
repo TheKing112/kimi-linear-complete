@@ -13,8 +13,12 @@ import psutil
 import json
 import os
 import time
+import logging
+import gc
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+
+logger = logging.getLogger(__name__)
 
 class RemoteControl(commands.Cog):
     def __init__(self, bot):
@@ -208,14 +212,23 @@ class RemoteControl(commands.Cog):
         """Automatischer Status-Check alle 5 Minuten"""
         if not self.control_channel:
             return
-            
+        
         try:
             status = await self.get_quick_status()
+            
             if status['cpu'] > 90 or status['memory'] > 85:
-                embed = discord.Embed(title="⚠️ Hohe Auslastung erkannt!", description=f"CPU: {status['cpu']}%\nRAM: {status['memory']}%", color=discord.Color.orange(), timestamp=datetime.now())
+                embed = discord.Embed(
+                    title="⚠️ Hohe Auslastung erkannt!",
+                    description=f"CPU: {status['cpu']}%\nRAM: {status['memory']}%",
+                    color=discord.Color.orange(),
+                    timestamp=datetime.now()
+                )
                 await self.control_channel.send(embed=embed)
         except Exception as e:
-            print(f"Status-Monitor Fehler: {e}")
+            logger.error(f"Status monitor error: {e}")
+        finally:
+            # Cleanup
+            gc.collect()
 
     @status_monitor.before_loop
     async def before_status_monitor(self):
@@ -253,6 +266,29 @@ class RemoteControl(commands.Cog):
             "services_stopped": "Alle Container",
             "logs": result.stdout if result.returncode == 0 else result.stderr
         }
+
+    # ✅ NEU - Wrapper für alle Docker Commands
+    async def _safe_docker_command(
+        self,
+        cmd: List[str],
+        timeout: int = 60
+    ) -> subprocess.CompletedProcess:
+        """Safe docker command execution with timeout"""
+        try:
+            return subprocess.run(
+                cmd,
+                cwd="/home/ubuntu/kimi-linear-complete/application",
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False  # Nicht automatisch Exception bei non-zero
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(f"Command timeout: {' '.join(cmd)}")
+            raise
+        except Exception as e:
+            logger.error(f"Command failed: {e}")
+            raise
 
     async def get_full_status(self) -> Dict[str, Any]:
         """Hole kompletten System-Status"""
@@ -314,11 +350,29 @@ class RemoteControl(commands.Cog):
         )
         return result.stdout if result.returncode == 0 else result.stderr
 
+    # ✅ NACHHER
     async def manage_service(self, action: str, service: str) -> Dict[str, Any]:
-        """Starte/Stoppe/Restarte einzelnen Service"""
-        cmd = [action] if action == "logs" else [action, service]
-        result = subprocess.run(["docker-compose"] + cmd, cwd="/home/ubuntu/kimi-linear-complete/application", capture_output=True, text=True)
-        return {"success": result.returncode == 0, "message": result.stdout if result.returncode == 0 else result.stderr}
+        # Whitelist validation
+        allowed_actions = {'start', 'stop', 'restart', 'logs'}
+        if action not in allowed_actions:
+            raise ValueError(f"Invalid action: {action}")
+        
+        allowed_services = await self.get_service_list()
+        if service and service not in allowed_services:
+            raise ValueError(f"Invalid service: {service}")
+        
+        cmd = ["docker-compose", action]
+        if service and action != "logs":
+            cmd.append(service)
+        
+        result = subprocess.run(
+            cmd,
+            cwd="/home/ubuntu/kimi-linear-complete/application",
+            capture_output=True,
+            text=True,
+            timeout=60  # NEU - Timeout
+        )
+        return {"success": result.returncode == 0, "message": result.stdout or result.stderr}
 
     async def get_service_list(self) -> List[str]:
         """Hole Liste aller Services"""

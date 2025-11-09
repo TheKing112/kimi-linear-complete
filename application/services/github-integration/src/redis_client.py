@@ -15,7 +15,15 @@ logger = logging.getLogger(__name__)
 class RedisClient:
     def __init__(self):
         self.client = redis.from_url(
-            os.getenv("REDIS_URL", "redis://localhost:6379")
+            os.getenv("REDIS_URL", "redis://localhost:6379"),
+            encoding="utf-8",
+            decode_responses=True,
+            max_connections=50,
+            socket_keepalive=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            retry_on_timeout=True,
+            health_check_interval=30
         )
         self.max_retries = 3
 
@@ -51,6 +59,31 @@ class RedisClient:
         
         return False
 
+    async def acquire_lock_with_timeout(
+        self,
+        lock_name: str,
+        timeout: int = 300,
+        acquire_timeout: int = 30
+    ) -> bool:
+        """Acquire lock with acquisition timeout"""
+        lock_key = f"lock:{lock_name}"
+        start_time = time.time()
+        
+        while time.time() - start_time < acquire_timeout:
+            acquired = await self.client.set(
+                lock_key,
+                "1",
+                nx=True,
+                ex=timeout
+            )
+            
+            if acquired:
+                return True
+            
+            await asyncio.sleep(0.1)
+        
+        return False
+
     async def release_lock(self, lock_name: str):
         """Release lock"""
         await self.client.delete(f"lock:{lock_name}")
@@ -73,9 +106,16 @@ class RedisClient:
     async def ensure_connection(self):
         """Ensure Redis is connected"""
         if not await self.health_check():
-            # Reconnect
             self.client = redis.from_url(
-                os.getenv("REDIS_URL", "redis://localhost:6379")
+                os.getenv("REDIS_URL", "redis://localhost:6379"),
+                encoding="utf-8",
+                decode_responses=True,
+                max_connections=50,
+                socket_keepalive=True,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+                retry_on_timeout=True,
+                health_check_interval=30
             )
             logger.info("Redis reconnected")
 
@@ -87,9 +127,10 @@ class RedisClient:
         ttl: int = 3600
     ):
         """Mark request as processed with validation"""
-        # TTL validieren
-        if ttl < 60 or ttl > 86400:
-            raise ValueError("TTL must be between 60s and 24h")
+        if ttl < 60:
+            raise ValueError("TTL must be at least 60 seconds")
+        if ttl > 86400:
+            raise ValueError("TTL cannot exceed 24 hours")
         
         request_hash = hashlib.sha256(
             f"{user_id}:{repo_url}:{prompt}".encode()

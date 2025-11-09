@@ -17,7 +17,9 @@ import uuid
 import time
 import asyncio
 import logging
-import aiohttp  # ✅ NEU
+import aiohttp
+import hashlib
+import urllib.parse
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -32,7 +34,7 @@ class TimeoutError(Exception):
     """Operation timed out"""
     pass
 
-class HTTPException(Exception):  # ✅ NEU
+class HTTPException(Exception):
     def __init__(self, status_code: int, detail: str):
         self.status_code = status_code
         self.detail = detail
@@ -51,6 +53,9 @@ class AutonomousEditor:
         # Redis-Client mit Timeout-Handling
         self.redis_client = redis_client
         
+        # HTTP Session für persistente Verbindungen
+        self._session: Optional[aiohttp.ClientSession] = None
+        
         # Bestehende Konfiguration
         self.kimi_url = os.getenv("KIMI_LINEAR_URL", "http://kimi-linear:8003")
         self.cognee_url = os.getenv("COGNEE_URL", "http://cognee:8001")
@@ -59,26 +64,41 @@ class AutonomousEditor:
         self.max_tokens = int(os.getenv("AUTONOMOUS_MAX_TOKENS", "4096"))
 
     def _validate_github_url(self, url: str) -> bool:
-        """Validate GitHub URL with improved pattern"""
+        """Enhanced GitHub URL validation"""
         # Basic pattern check
-        pattern = r"^https://github\.com/[a-zA-Z0-9-_.]+/[a-zA-Z0-9-_.]+/?$"
+        pattern = r"^https://github\.com/[a-zA-Z0-9][-a-zA-Z0-9]{0,38}/[a-zA-Z0-9._-]{1,100}/?$"
         if not re.match(pattern, url):
-            raise ValueError(f"Invalid GitHub URL: {url}")
+            raise ValueError(f"Invalid GitHub URL format: {url}")
         
-        # ✅ NEU - Zusätzliche Checks
-        if url.count('/') < 4:
-            raise ValueError("URL must include owner and repo")
+        # Additional checks
+        parsed = urllib.parse.urlparse(url)
         
-        parts = url.rstrip('/').split('/')
-        owner, repo = parts[-2], parts[-1]
+        # Check scheme
+        if parsed.scheme != 'https':
+            raise ValueError("Only HTTPS URLs allowed")
         
-        if len(owner) < 1 or len(repo) < 1:
-            raise ValueError("Owner and repo names cannot be empty")
+        # Check domain
+        if parsed.netloc != 'github.com':
+            raise ValueError("Only github.com URLs allowed")
         
-        # Check for suspicious characters
-        suspicious = ['..', '<', '>', '|', '&', ';']
-        if any(char in url for char in suspicious):
-            raise ValueError("URL contains suspicious characters")
+        # Extract parts
+        parts = parsed.path.strip('/').split('/')
+        if len(parts) != 2:
+            raise ValueError("URL must be in format: github.com/owner/repo")
+        
+        owner, repo = parts
+        
+        # Validate owner (GitHub username rules)
+        if not re.match(r'^[a-zA-Z0-9][-a-zA-Z0-9]{0,38}$', owner):
+            raise ValueError(f"Invalid owner name: {owner}")
+        
+        # Validate repo (GitHub repo rules)
+        if not re.match(r'^[a-zA-Z0-9._-]{1,100}$', repo):
+            raise ValueError(f"Invalid repo name: {repo}")
+        
+        # Check for path traversal attempts
+        if '..' in url or parsed.path.count('//') > 0:
+            raise ValueError("Path traversal detected")
         
         return True
 
@@ -109,7 +129,7 @@ class AutonomousEditor:
         
         return plan
 
-    async def acquire_lock_with_retry(  # ✅ NEU
+    async def acquire_lock_with_retry(
         self,
         lock_name: str,
         max_retries: int = 3,
@@ -136,11 +156,62 @@ class AutonomousEditor:
         
         return False
 
+    async def is_duplicate_and_mark(
+        self,
+        user_id: str,
+        repo_url: str,
+        prompt: str,
+        ttl: int = 3600
+    ) -> bool:
+        """Atomare Operation mit Lua Script"""
+        request_hash = hashlib.sha256(
+            f"{user_id}:{repo_url}:{prompt}".encode()
+        ).hexdigest()
+        
+        # Lua script für atomare Operation
+        lua_script = """
+        local key = KEYS[1]
+        local value = ARGV[1]
+        local ttl = ARGV[2]
+        
+        if redis.call('exists', key) == 1 then
+            return 1  -- Already exists
+        else
+            redis.call('setex', key, ttl, value)
+            return 0  -- Set successful
+        end
+        """
+        
+        result = await self.redis_client.client.eval(
+            lua_script,
+            keys=[f"autonomous:request:{request_hash}"],
+            args=[
+                json.dumps({
+                    "user_id": user_id,
+                    "repo_url": repo_url,
+                    "timestamp": time.time()
+                }),
+                str(ttl)
+            ]
+        )
+        
+        return result == 1  # True if duplicate
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create HTTP session"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=300),
+                headers={"User-Agent": "Kimi-Autonomous-Editor/1.0"}
+            )
+        return self._session
+
     async def process_autonomous_request(
         self, 
         prompt: str, 
         repo_url: str, 
-        user_id: str
+        user_id: str,
+        timeout: Optional[float] = None
     ) -> Dict[str, Any]:
         """⏱️ Hauptfunktion: Autonome Bearbeitung mit Timeout-Handling und Latency-Tracking"""
         logger.info(f"🤖 Autonome Anfrage: {prompt[:50]}... für {repo_url}")
@@ -148,6 +219,23 @@ class AutonomousEditor:
         # 🔗 URL-Validierung am Anfang
         self._validate_github_url(repo_url)
         
+        timeout = timeout or float(os.getenv("AUTONOMOUS_TIMEOUT", "600"))
+        
+        try:
+            return await asyncio.wait_for(
+                self._process_internal(prompt, repo_url, user_id),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Operation timed out after {timeout}s")
+
+    async def _process_internal(
+        self,
+        prompt: str,
+        repo_url: str,
+        user_id: str
+    ) -> Dict[str, Any]:
+        """Internal processing logic"""
         # ⏱️ Latency-Tracking Start
         start_time = time.monotonic()
         operation_metrics = {}
@@ -157,7 +245,7 @@ class AutonomousEditor:
             lock_name = f"github:{repo_url}"
             lock_start = time.monotonic()
             
-            lock_acquired = await self.acquire_lock_with_retry(lock_name)  # ✅ VERBESSERT
+            lock_acquired = await self.acquire_lock_with_retry(lock_name)
             
             operation_metrics['lock_acquisition_ms'] = round((time.monotonic() - lock_start) * 1000, 2)
             
@@ -165,12 +253,9 @@ class AutonomousEditor:
                 raise ConflictError(f"Repository {repo_url} wird bereits bearbeitet")
             
             try:
-                # ⏱️ Duplicate-Check mit Timeout
+                # ⏱️ Atomarer Duplicate-Check
                 check_start = time.monotonic()
-                is_duplicate = await asyncio.wait_for(
-                    self.redis_client.is_duplicate_request(user_id, repo_url, prompt),
-                    timeout=5
-                )
+                is_duplicate = await self.is_duplicate_and_mark(user_id, repo_url, prompt)
                 operation_metrics['duplicate_check_ms'] = round((time.monotonic() - check_start) * 1000, 2)
                 
                 if is_duplicate:
@@ -188,7 +273,6 @@ class AutonomousEditor:
                 analysis = await self.analyze_prompt_and_repo(prompt, repo_url, user_id)
                 
                 # Schritt 2: Erstelle Implementierungsplan
-                # Annahme: risk_enum ist verfügbar - in echtem Code anpassen
                 class RiskEnum:
                     medium = "medium"
                 risk_enum = RiskEnum()
@@ -217,14 +301,6 @@ class AutonomousEditor:
                 # ⏱️ Hauptverarbeitungszeit berechnen
                 operation_metrics['main_processing_ms'] = round((time.monotonic() - process_start) * 1000, 2)
                 
-                # ⏱️ Markierung als verarbeitet mit Timeout
-                mark_start = time.monotonic()
-                await asyncio.wait_for(
-                    self.redis_client.mark_request_processed(user_id, repo_url, prompt),
-                    timeout=5
-                )
-                operation_metrics['mark_processed_ms'] = round((time.monotonic() - mark_start) * 1000, 2)
-                
                 # Erfolgreiche Antwort mit Metriken
                 return {
                     "status": "success",
@@ -244,8 +320,6 @@ class AutonomousEditor:
                 )
                 operation_metrics['lock_release_ms'] = round((time.monotonic() - release_start) * 1000, 2)
                 
-        except asyncio.TimeoutError as e:
-            raise TimeoutError(f"Operation timed out after {self.timeout}s: {str(e)}")
         except Exception as e:
             # Fehler mit Latency-Tracking zurückgeben
             raise self._enhance_error(e, start_time, operation_metrics)
@@ -311,7 +385,6 @@ class AutonomousEditor:
     async def execute_changes(self, plan: Dict[str, Any], repo_url: str, user_id: str) -> List[Dict[str, Any]]:
         """Führe die geplanten Änderungen aus"""
         
-        # GitHub Client für Änderungen
         from .github_client import GitHubClient
         github = GitHubClient()
         
@@ -391,64 +464,64 @@ class AutonomousEditor:
             "metadata": metadata
         }
         
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.cognee_url}/memory/store",
-                json=payload
-            ) as resp:
-                if resp.status != 201:
-                    logger.warning("Speichern der autonomen Aktion fehlgeschlagen")
+        session = await self._get_session()
+        async with session.post(
+            f"{self.cognee_url}/memory/store",
+            json=payload
+        ) as resp:
+            if resp.status != 201:
+                logger.warning("Speichern der autonomen Aktion fehlgeschlagen")
 
     async def get_repo_context(self, repo_url: str, user_id: str) -> Dict[str, Any]:
         """Hole Repository-Kontext aus Cognee"""
         # Query alle Files aus diesem Repo
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{self.cognee_url}/memory/search",
-                params={
-                    "query": repo_url,
-                    "user_id": user_id,
-                    "limit": 50
+        session = await self._get_session()
+        async with session.get(
+            f"{self.cognee_url}/memory/search",
+            params={
+                "query": repo_url,
+                "user_id": user_id,
+                "limit": 50
+            }
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return {
+                    "files": [mem["content"][:100] for mem in data.get("memories", [])],
+                    "languages": ["python"],  # Simplifiziert
+                    "last_updated": "2024-01-01"
                 }
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return {
-                        "files": [mem["content"][:100] for mem in data.get("memories", [])],
-                        "languages": ["python"],  # Simplifiziert
-                        "last_updated": "2024-01-01"
-                    }
         
         return {"files": [], "languages": [], "last_updated": None}
 
-    async def query_kimi(self, prompt: str, max_retries: int = 3) -> Dict[str, Any]:  # ✅ VERBESSERT
+    async def query_kimi(self, prompt: str, max_retries: int = 3) -> Dict[str, Any]:
         """Query Kimi Linear with retry logic"""
+        session = await self._get_session()
+        
         for attempt in range(max_retries):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{self.kimi_url}/generate",
-                        json={
-                            "messages": [
-                                {"role": "user", "content": prompt}
-                            ],
-                            "max_tokens": self.max_tokens
-                        },
-                        timeout=aiohttp.ClientTimeout(total=300)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            try:
-                                return json.loads(data["text"])
-                            except json.JSONDecodeError:
-                                return {"text": data["text"]}
-                        elif resp.status == 503:
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(2 ** attempt)
-                                continue
-                            raise HTTPException(503, "Kimi service unavailable")
-                        else:
-                            raise HTTPException(resp.status, f"Kimi error: {resp.status}")
+                async with session.post(
+                    f"{self.kimi_url}/generate",
+                    json={
+                        "messages": [
+                            {"role": "user", "content": prompt}
+                        ],
+                        "max_tokens": self.max_tokens
+                    }
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        try:
+                            return json.loads(data["text"])
+                        except json.JSONDecodeError:
+                            return {"text": data["text"]}
+                    elif resp.status == 503:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        raise HTTPException(503, "Kimi service unavailable")
+                    else:
+                        raise HTTPException(resp.status, f"Kimi error: {resp.status}")
             
             except asyncio.TimeoutError:
                 if attempt < max_retries - 1:
@@ -465,3 +538,8 @@ class AutonomousEditor:
                 raise
         
         return {"error": "Max retries exceeded"}
+
+    async def cleanup(self):
+        """Cleanup resources"""
+        if self._session and not self._session.closed:
+            await self._session.close()

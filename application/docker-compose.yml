@@ -18,6 +18,20 @@ services:
     networks:
       - ${NETWORK_NAME}
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   redis:
     image: redis:7-alpine
@@ -35,6 +49,20 @@ services:
     networks:
       - ${NETWORK_NAME}
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   kimi-linear:
     build:
@@ -65,31 +93,42 @@ services:
       - "8003:8003"
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
     deploy:
       resources:
+        limits:
+          cpus: '8.0'
+          memory: 64G
         reservations:
+          cpus: '4.0'
+          memory: 32G
           devices:
             - driver: nvidia
               count: all
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
-      interval: 60s
+      interval: 30s
       timeout: 30s
       retries: 5
-      start_period: 1200s
+      start_period: 600s
     networks:
       - ${NETWORK_NAME}
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   cognee:
     build: ./cognee
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_started
     volumes:
       - ./cognee:/app:ro
       - cognee_logs:/app/logs
@@ -105,6 +144,20 @@ services:
       retries: 3
     networks:
       - ${NETWORK_NAME}
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   discord-bot:
     build: ./discord-bot
@@ -126,9 +179,26 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./services/discord-bot:/app:ro
       - discord_logs:/app/logs
+    read_only: true
+    tmpfs:
+      - /tmp
     restart: unless-stopped
     networks:
       - ${NETWORK_NAME}
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   prometheus:
     image: prom/prometheus:latest
@@ -149,6 +219,20 @@ services:
       - '--web.enable-lifecycle'
     networks:
       - ${NETWORK_NAME}
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   grafana:
     image: grafana/grafana:latest
@@ -167,6 +251,20 @@ services:
       - prometheus
     networks:
       - ${NETWORK_NAME}
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   node-exporter:
     image: prom/node-exporter:latest
@@ -183,6 +281,20 @@ services:
       - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
     networks:
       - ${NETWORK_NAME}
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   nginx:
     image: nginx:alpine
@@ -199,6 +311,20 @@ services:
     restart: unless-stopped
     networks:
       - ${NETWORK_NAME}
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
   github-integration:
     build:
@@ -223,6 +349,20 @@ services:
     networks:
       - ${NETWORK_NAME}
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        labels: "service,project"
 
 volumes:
   postgres_data:

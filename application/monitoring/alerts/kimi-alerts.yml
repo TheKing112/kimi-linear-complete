@@ -1,0 +1,54 @@
+# ✅ NEU - Alerting Rules
+groups:
+  - name: kimi_linear_alerts
+    interval: 30s
+    rules:
+      # GPU Memory Alert
+      - alert: HighGPUMemoryUsage
+        expr: gpu_memory_used / gpu_memory_total > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU memory usage high ({{ $value }}%)"
+          description: "GPU {{ $labels.instance }} memory usage above 90%"
+      
+      # API Latency Alert
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API latency high ({{ $value }}s)"
+          description: "95th percentile latency above 10 seconds"
+      
+      # Service Down Alert
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Service {{ $labels.instance }} has been down for 2 minutes"
+      
+      # Database Connection Alert
+      - alert: DatabaseConnectionFailure
+        expr: cognee_database_connection_errors_total > 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection failures"
+          description: "More than 10 database connection failures in 5 minutes"
+      
+      # Rate Limit Alert
+      - alert: RateLimitExceeded
+        expr: rate(rate_limit_exceeded_total[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rate limit violations"
+          description: "More than 100 rate limit violations per second"

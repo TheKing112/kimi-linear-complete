@@ -70,18 +70,22 @@ class AutonomousApprovalView(View):
         self.repo_url = repo_url
         self.prompt = prompt
         self.value = None  # ✅ NEU - Track result
+        self.message = None  # ✅ NEU - Message Reference
     
     # ✅ NEU - Timeout Handler
     async def on_timeout(self):
-        """Called when view times out"""
+        """Cleanup when timeout"""
         for item in self.children:
             item.disabled = True
         
-        if hasattr(self, 'message'):
-            await self.message.edit(
-                content="⏱️ Approval-Anfrage abgelaufen (15 Minuten)",
-                view=self
-            )
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="⏱️ Approval-Anfrage abgelaufen (15 Minuten)",
+                    view=self
+                )
+            except discord.HTTPException:
+                pass  # Message gelöscht oder nicht mehr bearbeitbar
     
     @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.green)
     async def approve_callback(self, button: Button, interaction: discord.Interaction):
@@ -155,36 +159,37 @@ class KimiBot(commands.Bot):
         try:
             if self.session and not self.session.closed:
                 await self.session.close()
+                await asyncio.sleep(0.25)  # ✅ NEU - Warte auf Cleanup
                 logger.info("HTTP Session geschlossen")
         except Exception as e:
             logger.error(f"Error closing session: {e}")
         
         # ✅ NEU - Executor cleanup
         if self.health_executor:
-            self.health_executor.shutdown(wait=True)
+            self.health_executor.shutdown(wait=True, timeout=5)
             logger.info("Health server executor shutdown")
         
         await super().close()
 
-# ✅ NEU - Nach KimiBot Class Definition
+# ✅ NEU - Mit Lock für Thread-Safety
 class RateLimiter:
     def __init__(self, max_requests: int = 10, window: int = 60):
         self.max_requests = max_requests
         self.window = window
         self.requests = defaultdict(list)
+        self._locks = defaultdict(asyncio.Lock)
     
-    def is_allowed(self, user_id: str) -> bool:
-        now = time()
-        user_requests = self.requests[user_id]
-        
-        # Entferne alte Requests
-        user_requests[:] = [req for req in user_requests if now - req < self.window]
-        
-        if len(user_requests) >= self.max_requests:
-            return False
-        
-        user_requests.append(now)
-        return True
+    async def is_allowed(self, user_id: str) -> bool:
+        async with self._locks[user_id]:
+            now = time()
+            user_requests = self.requests[user_id]
+            user_requests[:] = [req for req in user_requests if now - req < self.window]
+            
+            if len(user_requests) >= self.max_requests:
+                return False
+            
+            user_requests.append(now)
+            return True
     
     def reset(self, user_id: str):
         self.requests.pop(user_id, None)
@@ -221,19 +226,29 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    """Globale Fehlerbehandlung"""
-    # ✅ RICHTIG - Spezifische Error Codes
-    if isinstance(error, BotError):
+    """Global error handler"""
+    if isinstance(error, commands.CommandNotFound):
+        return  # Ignoriere unbekannte Commands
+    
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Fehlendes Argument: `{error.param.name}`")
+    
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Ungültiges Argument: {str(error)}")
+    
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏱️ Bitte warte {error.retry_after:.1f}s")
+    
+    elif isinstance(error, BotError):
         embed = discord.Embed(
             title=f"❌ Fehler ({error.code})",
             description=error.message,
             color=discord.Color.red()
         )
         await ctx.send(embed=embed)
-    elif isinstance(error, commands.CommandNotFound):
-        return
+    
     else:
-        logger.error(f"Unhandled error: {error}", exc_info=True)
+        logger.error(f"Unhandled error in {ctx.command}: {error}", exc_info=True)
         await ctx.send("❌ Ein unerwarteter Fehler ist aufgetreten.")
 
 # ===== CODE GENERATION =====
@@ -241,7 +256,7 @@ async def on_command_error(ctx: commands.Context, error):
 async def generate_code(ctx: commands.Context, *, prompt: str):
     """Generiere Code mit Kimi Linear 48B"""
     # ✅ Rate Limit Check
-    if not rate_limiter.is_allowed(str(ctx.author.id)):
+    if not await rate_limiter.is_allowed(str(ctx.author.id)):
         await ctx.send("⏱️ Rate limit erreicht. Bitte warte 60 Sekunden.")
         return
     
@@ -293,25 +308,49 @@ def build_enhanced_prompt(prompt: str, memories: list) -> str:
         context += "\n"
     return f"{context}Generate high-quality Python code for: {prompt}\n\nRequirements:\n- Include proper error handling and type hints\n- Add comprehensive docstrings\n- Follow PEP 8 style guidelines\n- Make it production-ready\n- Include example usage if appropriate\n\nCode:\n```python\n"
 
-async def generate_with_kimi(prompt: str) -> Optional[dict]:
-    """Rufe Kimi Linear API auf"""
-    try:
-        payload = {"prompt": prompt, "max_tokens": 2048, "temperature": 0.2, "top_p": 0.95}
-        async with bot.session.post(f"{bot.kimi_url}/generate", json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            elif resp.status == 503:
-                logger.error("Model not loaded")
-                return None
-            else:
-                logger.error(f"Kimi API error: {resp.status}")
-                return None
-    except aiohttp.ClientError as e:
-        logger.error(f"Network error: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        return None
+async def generate_with_kimi(
+    prompt: str,
+    max_retries: int = 3,
+    base_delay: float = 2.0
+) -> Optional[dict]:
+    """Rufe Kimi Linear API auf mit Retry-Logik"""
+    for attempt in range(max_retries):
+        try:
+            payload = {"prompt": prompt, "max_tokens": 2048, "temperature": 0.2, "top_p": 0.95}
+            async with bot.session.post(f"{bot.kimi_url}/generate", json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                elif resp.status == 503:
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(f"Kimi unavailable, retry in {delay}s...")
+                        await asyncio.sleep(delay)
+                        continue
+                    logger.error("Model not loaded after all retries")
+                    return None
+                else:
+                    logger.error(f"Kimi API error: {resp.status}")
+                    return None
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Timeout, retry in {delay}s...")
+                await asyncio.sleep(delay)
+                continue
+            logger.error("Timeout after all retries")
+            return None
+        except aiohttp.ClientError as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"Network error: {e}, retry in {delay}s...")
+                await asyncio.sleep(delay)
+                continue
+            logger.error(f"Network error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return None
+    return None
 
 async def store_memory(user_id: str, content: str, prompt: str, tokens: int, guild_id: Optional[str]):
     """Speichere generierten Code in Cognee"""

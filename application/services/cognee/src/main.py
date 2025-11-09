@@ -7,15 +7,19 @@ Cognee Memory API - Vektor-Datenbank für Code-Memories
 
 import os
 import logging
+import json
+import re
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
+from functools import wraps
+from collections import defaultdict
+from time import time
 
 import asyncpg
 import numpy as np
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field, validator
 from sentence_transformers import SentenceTransformer
-import re
 import networkx as nx
 from asyncpg.exceptions import UniqueViolationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,15 +46,22 @@ app.add_middleware(
 
 # Pydantic Models
 class MemoryRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, max_length=255)
+    user_id: str = Field(..., min_length=1, max_length=255, pattern=r'^[a-zA-Z0-9_-]+$')
     content: str = Field(..., min_length=10, max_length=100000)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict, max_items=50)
     
     @validator('content')
     def validate_content(cls, v):
         if len(v.strip()) < 10:
             raise ValueError('Content too short after stripping')
         return v.strip()
+    
+    @validator('metadata')
+    def validate_metadata(cls, v):
+        # Verhindere zu große metadata
+        if len(json.dumps(v)) > 10000:
+            raise ValueError('Metadata too large (max 10KB)')
+        return v
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -71,6 +82,9 @@ class UserMemoriesResponse(BaseModel):
 # Global state
 embeddings_model: Optional[SentenceTransformer] = None
 db_pool: Optional[asyncpg.Pool] = None
+
+# Rate limiting storage
+user_request_times = defaultdict(list)
 
 # Konstanten
 EMBEDDING_DIM = 384  # Für all-MiniLM-L6-v2
@@ -95,6 +109,29 @@ def generate_embedding(text: str) -> List[float]:
     embedding = embeddings_model.encode(text, convert_to_tensor=False)
     return embedding.tolist()
 
+def rate_limit(max_requests: int = 10, window: int = 60):
+    """Rate limiting decorator pro User"""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            request = kwargs.get('request') or args[0]
+            user_id = request.user_id
+            
+            now = time()
+            user_times = user_request_times[user_id]
+            user_times[:] = [t for t in user_times if now - t < window]
+            
+            if len(user_times) >= max_requests:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit: {max_requests} requests per {window}s"
+                )
+            
+            user_times.append(now)
+            return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
 async def init_database():
     """Initialisiere Datenbank und erstelle Tabellen"""
     global db_pool
@@ -103,15 +140,22 @@ async def init_database():
     if not db_url:
         raise ValueError("DATABASE_URL nicht gesetzt")
     
-    # ✅ RICHTIG - Skalierbarer Connection Pool
-    db_pool = await asyncpg.create_pool(
-        db_url,
-        min_size=5,
-        max_size=50,
-        command_timeout=60,
-        max_queries=50000,
-        max_inactive_connection_lifetime=300
-    )
+    # ✅ RICHTIG - Skalierbarer Connection Pool mit Error Handling
+    try:
+        db_pool = await asyncpg.create_pool(
+            db_url,
+            min_size=5,
+            max_size=50,
+            command_timeout=60,
+            max_queries=50000,
+            max_inactive_connection_lifetime=300,
+            server_settings={
+                'application_name': 'cognee-memory-api'
+            }
+        )
+    except Exception as e:
+        logger.error(f"Failed to create database pool: {e}")
+        raise RuntimeError("Database connection failed") from e
     
     # Erstelle Tabellen
     async with db_pool.acquire() as conn:
@@ -157,7 +201,7 @@ async def extract_knowledge_transactional(
     content: str,
     user_id: str
 ) -> None:
-    """Extrahiere Wissen mit Transaction-Support"""
+    """Extrahiere Wissen mit Transaction-Support - wird von allen schreibenden Endpoints genutzt"""
     try:
         functions = re.findall(r'def (\w+)\s*\(', content)
         classes = re.findall(r'class (\w+)', content)
@@ -205,8 +249,9 @@ async def startup_event():
         logger.error(f"Startup fehlgeschlagen: {e}")
         raise
 
-# ✅ RICHTIG - Mit Transaction
+# ✅ RICHTIG - Mit Transaction und Rate Limiting
 @app.post("/memory/store", status_code=201)
+@rate_limit(max_requests=100, window=60)
 async def store_memory(request: MemoryRequest):
     """Speichere Memory atomar mit Knowledge Graph"""
     try:
@@ -270,15 +315,17 @@ async def search_memory(query: str, user_id: Optional[str] = None, limit: int = 
                     LIMIT $2
                 """, query_embedding, limit)
         
-        memories = []
-        for row in rows:
-            memories.append(MemoryResponse(
+        # ✅ NACHHER - Bulk fetch mit List Comprehension
+        memories = [
+            MemoryResponse(
                 id=row['id'],
                 content=row['content'],
                 metadata=row['metadata'],
                 similarity=float(row['similarity']),
                 created_at=row['created_at']
-            ))
+            )
+            for row in rows
+        ]
         
         logger.info(f"{len(memories)} Memories gefunden")
         
@@ -288,13 +335,13 @@ async def search_memory(query: str, user_id: Optional[str] = None, limit: int = 
         logger.error(f"Suche fehlgeschlagen: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ RICHTIG - Mit Pagination
+# ✅ RICHTIG - Mit Pagination und SQL Injection Fix
 @app.get("/memory/user/{user_id}")
 async def get_user_memories(
     user_id: str,
     limit: int = 50,
-    offset: int = 0,  # ✅ NEU
-    order_by: str = "created_at"  # ✅ NEU
+    offset: int = 0,
+    order_by: str = "created_at"
 ):
     """Hole Memories mit Pagination"""
     try:
@@ -305,17 +352,16 @@ async def get_user_memories(
                 user_id
             )
             
-            # Validate order_by to prevent SQL injection
-            allowed_columns = {"created_at", "updated_at", "id"}
-            if order_by not in allowed_columns:
-                order_by = "created_at"
+            # ✅ NACHHER - Sichere Spaltenauswahl via Dictionary
+            allowed_columns = {"created_at": "created_at", "updated_at": "updated_at", "id": "id"}
+            order_column = allowed_columns.get(order_by, "created_at")
             
             # Fetch page
             rows = await conn.fetch(f"""
                 SELECT id, content, metadata, created_at
                 FROM memories
                 WHERE user_id = $1
-                ORDER BY {order_by} DESC
+                ORDER BY {order_column} DESC
                 LIMIT $2 OFFSET $3
             """, user_id, limit, offset)
         
@@ -331,7 +377,7 @@ async def get_user_memories(
         return {
             "user_id": user_id,
             "memories": memories,
-            "pagination": {  # ✅ NEU
+            "pagination": {
                 "total": total,
                 "limit": limit,
                 "offset": offset,
@@ -414,7 +460,9 @@ async def health_check():
             },
             "metrics": {
                 "embedding_dim": EMBEDDING_DIM,
-                "model_name": os.getenv("EMBEDDINGS_MODEL", "all-MiniLM-L6-v2")
+                "model_name": os.getenv("EMBEDDINGS_MODEL", "all-MiniLM-L6-v2"),
+                "rate_limit_window": "60s",
+                "rate_limit_max": 100
             }
         }
     except Exception as e:
@@ -434,5 +482,6 @@ async def root():
         "service": "Cognee Memory API",
         "version": "2.0.0",
         "embedding_dim": EMBEDDING_DIM,
-        "model": os.getenv("EMBEDDINGS_MODEL", "all-MiniLM-L6-v2")
+        "model": os.getenv("EMBEDDINGS_MODEL", "all-MiniLM-L6-v2"),
+        "features": ["rate_limiting", "transactional_knowledge", "sql_injection_protection"]
     }

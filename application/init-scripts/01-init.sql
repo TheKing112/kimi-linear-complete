@@ -91,9 +91,24 @@ WHERE metadata->>'keep_forever' IS DISTINCT FROM 'true';
 -- WIRD ERST NACH 1.000+ Einträgen erstellt für bessere Performance
 -- AUSKOMMENTIERT für Initial-Setup - manuell aktivieren wenn DB wächst
 -- =============================================================================
+-- ❌ VORHER (Blockierend)
 -- CREATE INDEX idx_memories_embedding ON memories 
 -- USING ivfflat(embedding vector_cosine_ops) 
 -- WITH (lists = 100);  -- Anpassen: lists = sqrt(rows) / gewünschte_clusters
+
+-- ✅ NACHHER - Non-blocking
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_embedding 
+ON memories USING ivfflat(embedding vector_cosine_ops) 
+WITH (lists = 100);
+
+-- ✅ NEU - Pagination Index für schnelle Cursor-Pagination
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_pagination
+ON memories(user_id, created_at DESC, id DESC);
+
+-- ✅ NEU - Optimiertes Composite Index nur für autonome Memories
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_autonomous_only
+ON memories(user_id, created_at DESC)
+WHERE is_autonomous = true;
 
 -- =============================================================================
 -- FUNCTION: Update Trigger für updated_at
@@ -252,6 +267,12 @@ BEGIN
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ✅ NEU - Autovacuum Optimierung nach Massenlöschungen
+ALTER TABLE memories SET (
+    autovacuum_vacuum_scale_factor = 0.1,
+    autovacuum_analyze_scale_factor = 0.05
+);
 
 -- =============================================================================
 -- FUNCTION: Get Memory Statistics
