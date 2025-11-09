@@ -372,6 +372,7 @@ volumes:
   discord_logs:
   cognee_logs:
   github_logs:
+  model_cache:  # ✅ Fehlte!
 
 networks:
   kimi-network:

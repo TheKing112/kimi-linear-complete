@@ -31,8 +31,20 @@ readonly VM_TYPE="g2-standard-8"
 readonly GPU_TYPE="nvidia-l4"
 readonly DISK_SIZE="400GB"
 readonly ZONES=("us-east1-b" "us-east1-c" "us-central1-a" "us-central1-b" "us-west1-b")
-readonly REPO_URL="https://github.com/dein-repo/kimi-linear-complete.git"  # ⚠️ Anpassen!
-readonly SETUP_SCRIPT_URL="https://raw.githubusercontent.com/dein-repo/kimi-linear-complete/main/setup-in-vm.sh"
+
+# Repository URL - kann als Argument oder über KIMI_REPO_URL Umgebungsvariable gesetzt werden
+# Standard: https://github.com/dein-repo/kimi-linear-complete.git
+REPO_URL="${1:-${KIMI_REPO_URL:-https://github.com/dein-repo/kimi-linear-complete.git}}"
+
+# Validiere GitHub URL
+if [[ ! "$REPO_URL" =~ ^https://github.com/ ]]; then
+    error "Ungültige GitHub URL: '$REPO_URL'. Muss mit https://github.com/ beginnen."
+fi
+
+# Leite Setup-Script URL aus Repository URL ab
+# Konvertiert https://github.com/user/repo.git -> https://raw.githubusercontent.com/user/repo/main/setup-in-vm.sh
+SETUP_SCRIPT_URL="${REPO_URL/github.com/raw.githubusercontent.com}"
+SETUP_SCRIPT_URL="${SETUP_SCRIPT_URL%.git}/main/setup-in-vm.sh"
 
 # ===== COLORS =====
 readonly RED='\033[0;31m'

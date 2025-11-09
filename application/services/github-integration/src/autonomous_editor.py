@@ -23,6 +23,7 @@ import urllib.parse
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 from datetime import datetime
+from .redis_client import RedisClient
 
 logger = logging.getLogger("autonomous-editor")
 
@@ -41,7 +42,7 @@ class HTTPException(Exception):
         super().__init__(f"HTTP {status_code}: {detail}")
 
 class AutonomousEditor:
-    def __init__(self, github_url: str, redis_client: 'RedisClient', timeout: int = 30):
+    def __init__(self, github_url: str, redis_client: RedisClient, timeout: int = 30):
         # 🆔 UUID-Branch-Namen - Setup
         self.timeout = timeout
         self.latency_tracker = {}
@@ -51,7 +52,7 @@ class AutonomousEditor:
         self.github_url = github_url
         
         # Redis-Client mit Timeout-Handling
-        self.redis_client = redis_client
+        self.redis_client = redis_client  # ✅
         
         # HTTP Session für persistente Verbindungen
         self._session: Optional[aiohttp.ClientSession] = None

@@ -1,13 +1,28 @@
 import os
-import time
 import re
-from github import Github, Repository, GithubException, RateLimitExceededException
-from git import Repo
+import signal
 import tempfile
+import time
+from contextlib import contextmanager
 from typing import Optional, Dict, Any, List
 import logging
 
+from github import Github, Repository, GithubException, RateLimitExceededException
+from git import Repo
+
 logger = logging.getLogger("github-client")
+
+@contextmanager
+def timeout(seconds):
+    def signal_handler(signum, frame):
+        raise TimeoutError(f"Operation timed out after {seconds}s")
+    
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
 
 class GitHubClient:
     def __init__(self, token: Optional[str] = None):
@@ -32,15 +47,20 @@ class GitHubClient:
         logger.info(f"Klonen {repo_id} (branch: {branch}) nach {tmp_dir}")
         
         try:
-            Repo.clone_from(
-                url,
-                tmp_dir,
-                branch=branch,
-                depth=100,  # Nur letzte 100 Commits für Performance
-                single_branch=True
-            )
+            # ✅ 10 Minuten max Timeout
+            with timeout(600):
+                Repo.clone_from(
+                    url,
+                    tmp_dir,
+                    branch=branch,
+                    depth=100,  # Nur letzte 100 Commits für Performance
+                    single_branch=True
+                )
             logger.info(f"✅ Repository geklont nach {tmp_dir}")
             return tmp_dir
+        except TimeoutError as e:
+            logger.error(f"Clone fehlgeschlagen (Timeout): {e}")
+            raise
         except Exception as e:
             logger.error(f"Clone fehlgeschlagen: {e}")
             raise

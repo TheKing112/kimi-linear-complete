@@ -159,15 +159,15 @@ class KimiBot(commands.Bot):
         try:
             if self.session and not self.session.closed:
                 await self.session.close()
-                await asyncio.sleep(0.25)  # ✅ NEU - Warte auf Cleanup
+                await asyncio.sleep(0.25)  # Warte auf Cleanup
                 logger.info("HTTP Session geschlossen")
         except Exception as e:
             logger.error(f"Error closing session: {e}")
         
-        # ✅ NEU - Executor cleanup
+        # ✅ FIX: timeout=5 entfernt, wait=False für nicht-blockierenden Shutdown
         if self.health_executor:
-            self.health_executor.shutdown(wait=True, timeout=5)
-            logger.info("Health server executor shutdown")
+            self.health_executor.shutdown(wait=False)
+            logger.info("Health server executor shutdown initiated")
         
         await super().close()
 

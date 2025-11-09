@@ -1,7 +1,7 @@
 -- =============================================================================
 -- KIMI LINEAR - COGNEE DATABASE INITIALIZATION
 -- PostgreSQL mit pgvector Extension
--- Version: 2.0
+-- Version: 2.1
 -- Embedding Dimension: 384 (für all-MiniLM-L6-v2)
 -- =============================================================================
 
@@ -72,15 +72,6 @@ CREATE INDEX idx_knowledge_user ON knowledge_graph(user_id);
 CREATE INDEX idx_knowledge_subject ON knowledge_graph(subject);
 CREATE INDEX idx_knowledge_predicate ON knowledge_graph(predicate);
 
--- Performance für Pagination (Composite Index)
-CREATE INDEX IF NOT EXISTS idx_memories_user_created 
-ON memories(user_id, created_at DESC);
-
--- Composite Index für häufige Queries nach autonomen Generierungen
-CREATE INDEX IF NOT EXISTS idx_memories_user_autonomous 
-ON memories(user_id, is_autonomous) 
-WHERE is_autonomous = true;
-
 -- Additional Time-based Index für cleanup_old_memories
 CREATE INDEX IF NOT EXISTS idx_memories_created_at 
 ON memories(created_at) 
@@ -101,11 +92,13 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_embedding
 ON memories USING ivfflat(embedding vector_cosine_ops) 
 WITH (lists = 100);
 
--- ✅ NEU - Pagination Index für schnelle Cursor-Pagination
+-- ✅ NEU - Pagination Index für schnelle Cursor-Pagination (ersetzt idx_memories_user_created)
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_pagination
 ON memories(user_id, created_at DESC, id DESC);
 
 -- ✅ NEU - Optimiertes Composite Index nur für autonome Memories
+-- Hinweis: Ein simpler Index auf (is_autonomous) ist redundant, da dieser Index
+-- alle notwendigen Queries abdeckt: user_id-Suche + Sortierung nach created_at
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_autonomous_only
 ON memories(user_id, created_at DESC)
 WHERE is_autonomous = true;
@@ -348,5 +341,5 @@ UNIQUE (user_id, subject, predicate, object);
 -- =============================================================================
 -- DONE: Schema erfolgreich initialisiert
 -- =============================================================================
-SELECT '✅ Cognee Database Schema v2.0 erfolgreich initialisiert!' AS status,
+SELECT '✅ Cognee Database Schema v2.1 erfolgreich initialisiert!' AS status,
        CURRENT_TIMESTAMP AS initialized_at;

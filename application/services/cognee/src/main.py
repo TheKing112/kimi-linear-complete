@@ -89,6 +89,7 @@ user_request_times = defaultdict(list)
 # Konstanten
 EMBEDDING_DIM = 384  # Für all-MiniLM-L6-v2
 KNOWLEDGE_CONFIDENCE_THRESHOLD = 0.7
+ALLOWED_COLUMNS = {"created_at": "created_at", "updated_at": "updated_at", "id": "id"}
 
 # Hilfsfunktionen
 def load_embeddings_model():
@@ -352,9 +353,11 @@ async def get_user_memories(
                 user_id
             )
             
-            # ✅ NACHHER - Sichere Spaltenauswahl via Dictionary
-            allowed_columns = {"created_at": "created_at", "updated_at": "updated_at", "id": "id"}
-            order_column = allowed_columns.get(order_by, "created_at")
+            # ✅ Sichere Spaltenauswahl via globales Dictionary
+            if order_by not in ALLOWED_COLUMNS:
+                raise HTTPException(status_code=400, detail="Invalid order_by column")
+            
+            order_column = ALLOWED_COLUMNS.get(order_by, "created_at")
             
             # Fetch page
             rows = await conn.fetch(f"""
