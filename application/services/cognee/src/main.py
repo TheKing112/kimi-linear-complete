@@ -283,24 +283,17 @@ async def extract_knowledge_transactional(
         for imp in imports:
             knowledge_records.append((user_id, f"user_{user_id}", 'imports_library', imp, 0.7))
         
-        # Bulk upsert knowledge triples using UNNEST for asyncpg compatibility
-        # ON CONFLICT DO UPDATE sets confidence to the higher value and updates timestamp
+        # Verwende executemany für asyncpg
         if knowledge_records:
-            await conn.execute("""
+            await conn.executemany("""
                 INSERT INTO knowledge_graph 
                 (user_id, subject, predicate, object, confidence)
-                SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float[])
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (user_id, subject, predicate, object)
                 DO UPDATE SET 
                     confidence = GREATEST(knowledge_graph.confidence, EXCLUDED.confidence),
                     created_at = CURRENT_TIMESTAMP
-            """, 
-                [r[0] for r in knowledge_records],  # user_id
-                [r[1] for r in knowledge_records],  # subject
-                [r[2] for r in knowledge_records],  # predicate
-                [r[3] for r in knowledge_records],  # object
-                [r[4] for r in knowledge_records]   # confidence
-            )
+            """, knowledge_records)
             
     except Exception as e:
         logger.warning(f"Knowledge extraction failed: {e}")

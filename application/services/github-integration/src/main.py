@@ -7,6 +7,7 @@ GitHub Integration Service
 
 import os
 import logging
+import asyncio
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -209,7 +210,8 @@ async def health_check():
         github_healthy = False
         rate_limit_info = None
         if github_client:
-            rate_limit = await github_client.get_rate_limit()
+            # Fix: get_rate_limit() ist sync, daher in Thread ausführen
+            rate_limit = await asyncio.to_thread(github_client.get_rate_limit)
             github_healthy = rate_limit is not None
             rate_limit_info = rate_limit
         
@@ -217,13 +219,8 @@ async def health_check():
         analyzer_healthy = analyzer is not None
         
         # ✅ Prüfe Redis
-        redis_healthy = False
-        if redis_client:
-            try:
-                redis_healthy = await redis_client.ping()
-            except Exception as e:
-                logger.error(f"Redis health check failed: {e}")
-                redis_healthy = False
+        # Fix: ping() existiert nicht, health_check() verwenden
+        redis_healthy = await redis_client.health_check() if redis_client else False
         
         # Bestimme Gesamt-Status
         if github_healthy and analyzer_healthy:

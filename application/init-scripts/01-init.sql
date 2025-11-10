@@ -93,24 +93,34 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_embedding
 ON memories USING ivfflat(embedding vector_cosine_ops) 
 WITH (lists = 100);
 
--- ✅ NEU - Pagination Index für schnelle Cursor-Pagination (ersetzt idx_memories_user_created)
+-- ✅ NEU - Pagination Index für schnelle Cursor-Pagination
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_pagination
 ON memories(user_id, created_at DESC, id DESC);
 
--- ✅ NEU - Optimiertes Composite Index nur für autonome Memories
--- Entfernt redundanten einfachen Index (falls vorhanden) und ersetzt ihn durch
--- einen optimierten Composite Index für user_id-Suche + Sortierung nach created_at
-DROP INDEX IF EXISTS idx_memories_autonomous;
+-- =============================================================================
+-- INDEX: Optimiertes Composite Index für autonome Memories
+-- ⚠️ WICHTIG: Partial Index (WHERE is_autonomous = true) macht separate 
+--            is_autonomous Spalte im Index überflüssig!
+-- =============================================================================
+
+-- Entferne alte, redundante Indexe falls vorhanden
+DROP INDEX IF EXISTS idx_memories_autonomous;  -- Falls existiert aus v2.0
+DROP INDEX IF EXISTS idx_memories_user_autonomous;  -- REDUNDANTER Index (s.u.)
+
+-- Korrekter, optimierter Index ohne redundante Spalte
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_autonomous_only
 ON memories(user_id, created_at DESC)
 WHERE is_autonomous = true;
 
--- ⚠️ HINWEIS: Der Index idx_memories_user_autonomous ist REDUNDANT und suboptimal!
--- Die Spalte 'is_autonomous' im Index ist überflüssig, da der Partial Index
--- (WHERE is_autonomous = true) bereits garantiert, dass alle Zeilen is_autonomous=true haben.
--- Der bestehende Index 'idx_memories_autonomous_only' (Zeile 119) ist die bessere Lösung.
--- Daher wird der redundante Index hier entfernt:
-DROP INDEX IF EXISTS idx_memories_user_autonomous;
+-- ✅ FIX: Redundanter Index (nicht mehr erstellen!)
+-- Der folgende Index wäre suboptimal, da is_autonomous im Index selbst
+-- redundant ist - der Partial WHERE-Filter garantiert bereits alle Zeilen
+-- haben is_autonomous=true. Stattdessen wird nur der obige Index verwendet.
+-- 
+-- ❌ NICHT ERSTELLEN:
+-- CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_user_autonomous
+-- ON memories(user_id, is_autonomous, created_at DESC)
+-- WHERE is_autonomous = true;
 
 -- ✅ HINZUFÜGEN nach allen CREATE INDEX:
 -- Automatische Index-Pflege
