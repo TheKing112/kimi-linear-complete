@@ -400,21 +400,23 @@ async def generate(request: GenerateRequest):
             logger.error(f"Generation error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
-# NEU - Generate Internal mit OOM Recovery und GPU Serialization
+# ✅ NEU & KORRIGIERT: Vollständige Funktion mit OOM-Recovery und GPU-Serialisierung
 async def generate_internal(request: GenerateRequest) -> GenerateResponse:
-    """Internal generation logic with OOM recovery"""
-    async with _generation_lock:  # ✅ Serialize GPU access
+    """Interne Generierungslogik mit OOM-Wiederherstellung und GPU-Serialisierung"""
+    async with _generation_lock:  # ✅ GPU-Zugriff serialisieren
         try:
             start_time = time.time()
             
-            # Prepare input
+            # Input vorbereiten
             prompt = build_prompt(request)
             inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
             
             input_length = inputs["input_ids"].shape[1]
             
-            # Generate
+            # Generierung (synchron, aber durch Lock geschützt)
+            # TODO: Für echte Non-Blocking-Operation in Produktivsystemen:
+            # outputs = await asyncio.to_thread(model.generate, **params)
             with torch.no_grad():
                 outputs = model.generate(
                     **inputs,
@@ -427,64 +429,42 @@ async def generate_internal(request: GenerateRequest) -> GenerateResponse:
                     use_cache=True
                 )
             
-            # Decode only new tokens
+            # Nur neue Tokens dekodieren
             generated_tokens = outputs[0][input_length:]
             generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
             
-            generation_time = (time.time() - start_time) * 1000
+            generation_time_ms = (time.time() - start_time) * 1000
             
-            # Prepare response
+            # Antwort vorbereiten
             response = GenerateResponse(
                 text=generated_text,
                 tokens_used=len(generated_tokens),
-                model=model_config["model_name"],
-                generation_time_ms=generation_time,
-                memory_id=None  # Will be set if stored
+                model=model_config.get("model_name", "kimi-linear-48b"),
+                generation_time_ms=generation_time_ms,
+                memory_id=None
             )
-            
-            # Store extended metadata if requested
-            if request.store_metadata:
-                meta = {
-                    "prompt_text": prompt[:500],  # Truncate for storage
-                    "prompt_tokens": input_length,
-                    "generated_tokens": len(generated_tokens),
-                    "total_tokens": input_length + len(generated_tokens),
-                    "generation_time_ms": generation_time,
-                    "temperature": request.temperature,
-                    "top_p": request.top_p,
-                    "model_name": model_config["model_name"],
-                    "model_version": "1.0.0",
-                    "gpu_device": str(model.device)
-                }
-                
-                # Note: In production, you'd want to store this asynchronously
-                # and return the memory_id in the response
             
             return response
             
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                logger.error("CUDA OOM detected, attempting recovery...")
-                
-                # Clear cache
+                logger.error("CUDA OOM erkannt, versuche Wiederherstellung...")
                 torch.cuda.empty_cache()
                 
-                # Try with reduced batch size / tokens
+                # Reduziere Tokens und versuche es erneut (nur einmal)
                 if request.max_tokens > 512:
-                    logger.warning(f"Reducing max_tokens from {request.max_tokens} to 512")
+                    logger.warning(f"Reduziere max_tokens von {request.max_tokens} auf 512")
                     request.max_tokens = 512
-                    
-                    # Retry once
-                    return await generate_internal(request)
-                else:
-                    raise HTTPException(
-                        status_code=503,
-                        detail="GPU out of memory. Please reduce input size or try again later."
-                    )
+                    return await generate_internal(request)  # Einmaliger Retry
+                
+                raise HTTPException(
+                    status_code=503,
+                    detail="GPU Speicher voll. Bitte Eingabe verkleinern oder später erneut versuchen."
+                )
             else:
                 raise
         except Exception as e:
-            logger.error(f"Generation error: {e}", exc_info=True)
+            logger.error(f"Generierungsfehler: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health", response_model=HealthResponse)

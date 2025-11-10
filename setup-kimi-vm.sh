@@ -33,8 +33,8 @@ readonly DISK_SIZE="400GB"
 readonly ZONES=("us-east1-b" "us-east1-c" "us-central1-a" "us-central1-b" "us-west1-b")
 
 # Repository URL - kann als Argument oder über KIMI_REPO_URL Umgebungsvariable gesetzt werden
-# Standard: https://github.com/dein-repo/kimi-linear-complete.git
-REPO_URL="${1:-${KIMI_REPO_URL:-https://github.com/dein-repo/kimi-linear-complete.git}}"
+# Standard: https://github.com/your-org/kimi-linear-complete.git
+REPO_URL="${1:-${KIMI_REPO_URL:-https://github.com/your-org/kimi-linear-complete.git}}"
 
 # Validiere GitHub URL
 if [[ ! "$REPO_URL" =~ ^https://github.com/ ]]; then

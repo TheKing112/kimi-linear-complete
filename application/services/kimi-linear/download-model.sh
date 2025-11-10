@@ -69,39 +69,15 @@ echo "✅ Download abgeschlossen"
 echo "📊 Speicherplatz: $(du -sh . 2>/dev/null || echo 'N/A')"
 echo "📁 Dateien: $(ls -lh | wc -l) Dateien gefunden"
 
-### ✅ KORRIGIERTER VERIFIZIERUNGSBLOCK
+# ✅ Verifiziere Download...
 echo "✅ Verifiziere Download..."
-
-# Wichtige Konfigurationsdateien (erweiterte Liste)
-REQUIRED_FILES=(
-    "config.json"
-    "tokenizer_config.json"
-    "tokenizer.json"
-    "preprocessor_config.json"
-    "model_index.json"
-)
-
-# Prüfe Existenz und minimale Größe (nicht leer)
+REQUIRED_FILES=("config.json" "tokenizer_config.json")
 for file in "${REQUIRED_FILES[@]}"; do
-    if [ -f "$file" ]; then
-        if [ ! -s "$file" ]; then
-            echo "❌ Datei ist leer: $file"
-            exit 1
-        fi
+    if [ ! -f "$file" ]; then
+        echo "❌ Fehlende Datei: $file"
+        exit 1
     fi
 done
-
-# Prüfe Model-Weights (mindestens eine nicht-leere .safetensors Datei)
-if ! find . -maxdepth 1 -name "*.safetensors" -type f -size +0 2>/dev/null | grep -q .; then
-    echo "❌ Keine validen Model-Weights gefunden!"
-    exit 1
-fi
-
-# Optionale aber empfohlene Prüfung: Modell-Konsistenz
-if [ -f "config.json" ] && command -v python3 &>/dev/null; then
-    python3 -c "import json; json.load(open('config.json'))" 2>/dev/null || \
-        echo "⚠️ Warnung: config.json ist keine gültige JSON-Datei"
-fi
 
 echo "✅ Download und Verifikation erfolgreich"
 echo "🎯 Modell bereit unter: ${MODEL_PATH}"

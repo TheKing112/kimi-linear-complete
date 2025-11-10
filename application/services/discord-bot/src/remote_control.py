@@ -173,6 +173,11 @@ class RemoteControl(commands.Cog):
                     await ctx.send(embed=embed)
                     
                 elif action == "logs":
+                    # ✅ Service-Validierung hinzugefügt
+                    allowed_services = await self.get_service_list()
+                    if service not in allowed_services:
+                        raise ValueError(f"Ungültiger Service: `{service}`. Verfügbar: {', '.join(allowed_services)}")
+                    
                     logs = await self.get_service_logs(service, lines=20)
                     embed = discord.Embed(
                         title=f"📝 Logs: {service}", 
@@ -516,16 +521,13 @@ class RemoteControl(commands.Cog):
 
     async def manage_service(self, action: str, service: str) -> Dict[str, Any]:
         """Verwalte einzelnen Service (start/stop/restart)"""
-        # Whitelist validation
+        # ✅ Vereinfachte Validierung wie im Snippet vorgeschlagen
         if action not in ALLOWED_DOCKER_ACTIONS:
-            raise ValueError(f"Ungültige Aktion: {action}. Erlaubt: {', '.join(ALLOWED_DOCKER_ACTIONS)}")
+            raise ValueError(f"Ungültige Aktion: {action}")
         
         allowed_services = await self.get_service_list()
-        if not service:
-            raise ValueError("Service-Name erforderlich")
-            
-        if service not in allowed_services:
-            raise ValueError(f"Ungültiger Service: {service}. Verfügbar: {', '.join(allowed_services)}")
+        if service and service not in allowed_services:
+            raise ValueError(f"Ungültiger Service: {service}")
         
         try:
             result = await self._safe_docker_command(["docker-compose", action, service])

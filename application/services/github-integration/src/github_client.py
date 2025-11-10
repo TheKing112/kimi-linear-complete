@@ -1,71 +1,79 @@
 import os
 import re
-import signal
-import tempfile
 import time
-from contextlib import contextmanager
-from typing import Optional, Dict, Any, List
+import tempfile
 import logging
+from typing import Optional, Dict, Any, List
+import concurrent.futures
+import shutil
 
 from github import Github, Repository, GithubException, RateLimitExceededException
 from git import Repo
 
 logger = logging.getLogger("github-client")
 
-@contextmanager
-def timeout(seconds):
-    def signal_handler(signum, frame):
-        raise TimeoutError(f"Operation timed out after {seconds}s")
-    
-    signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
 
 class GitHubClient:
     def __init__(self, token: Optional[str] = None):
+        """Initialisiert GitHub-Client mit Token (optional)"""
         self.token = token or os.getenv("GITHUB_TOKEN")
         self.github = Github(self.token) if self.token else Github()
         
     def is_authenticated(self) -> bool:
+        """Prüft, ob ein GitHub Token verfügbar ist"""
         return self.token is not None
     
     def extract_repo_id(self, url: str) -> str:
-        """Extrahiere owner/repo aus URL"""
+        """Extrahiert owner/repo aus einer GitHub-URL"""
         if url.endswith(".git"):
             url = url[:-4]
         parts = url.split("/")
         return f"{parts[-2]}/{parts[-1]}"
     
     def clone_repo(self, url: str, branch: str = "main") -> str:
-        """Klone Repository in temporäres Verzeichnis"""
+        """Klont Repository in temporäres Verzeichnis mit plattformübergreifendem Timeout"""
         repo_id = self.extract_repo_id(url)
         tmp_dir = tempfile.mkdtemp(prefix=f"github_{repo_id.replace('/', '_')}_")
         
         logger.info(f"Klonen {repo_id} (branch: {branch}) nach {tmp_dir}")
         
         try:
-            # ✅ 10 Minuten max Timeout
-            with timeout(600):
-                Repo.clone_from(
+            # ✅ PLATTFORMÜBERGREIFEND: concurrent.futures statt signal.alarm
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    Repo.clone_from,
                     url,
                     tmp_dir,
                     branch=branch,
                     depth=100,  # Nur letzte 100 Commits für Performance
                     single_branch=True
                 )
+                try:
+                    future.result(timeout=600)  # 10 Minuten max
+                except concurrent.futures.TimeoutError:
+                    raise TimeoutError("Clone-Operation timed out after 600s")
+                
             logger.info(f"✅ Repository geklont nach {tmp_dir}")
             return tmp_dir
+            
         except TimeoutError as e:
             logger.error(f"Clone fehlgeschlagen (Timeout): {e}")
+            self._cleanup_tmp_dir(tmp_dir)
             raise
+            
         except Exception as e:
             logger.error(f"Clone fehlgeschlagen: {e}")
+            self._cleanup_tmp_dir(tmp_dir)
             raise
     
-    async def get_rate_limit(self) -> Dict[str, Any]:
+    def _cleanup_tmp_dir(self, tmp_dir: str):
+        """Helfer-Methode zum Aufräumen temporärer Verzeichnisse"""
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception as e:
+            logger.warning(f"Temp-Verzeichnis Cleanup fehlgeschlagen: {e}")
+
+    def get_rate_limit(self) -> Dict[str, Any]:
         """GitHub API Rate Limit Info"""
         try:
             rate = self.github.get_rate_limit()
@@ -78,18 +86,17 @@ class GitHubClient:
             logger.warning(f"Rate Limit Abfrage fehlgeschlagen: {e}")
             return {"error": str(e)}
     
-    # ✅ RICHTIG - Mit Max Retries und Timeout
     def execute_with_rate_limit(
         self,
         func,
         *args,
         max_retries: int = 3,
-        max_wait: int = 3600,  # NEU - Max 1 Stunde warten
+        max_wait: int = 3600,  # Max 1 Stunde warten
         **kwargs
     ):
-        """Führe GitHub-Operation mit Rate-Limit-Handling und max retries aus"""
+        """Führt GitHub-Operation mit Rate-Limit-Handling und Max-Retries aus"""
         retries = 0
-        total_wait = 0  # NEU - Wartezeit tracking
+        total_wait = 0  # Wartezeit-Tracking
         
         while retries < max_retries:
             try:
@@ -105,7 +112,7 @@ class GitHubClient:
                 reset_time = self.github.rate_limiting_resettime
                 wait_seconds = max(reset_time - time.time(), 0) + 60
                 
-                # NEU - Check max wait
+                # Check max wait
                 if total_wait + wait_seconds > max_wait:
                     raise Exception(f"Max wait time ({max_wait}s) exceeded")
                 
@@ -115,7 +122,7 @@ class GitHubClient:
                 )
                 
                 time.sleep(wait_seconds)
-                total_wait += wait_seconds  # NEU - Update total wait
+                total_wait += wait_seconds  # Update total wait
             
             except Exception as e:
                 logger.error(f"GitHub API Fehler: {e}")
@@ -123,9 +130,8 @@ class GitHubClient:
         
         raise Exception("Unerwartet: Max retries ohne Ausnahme")
     
-    # ✅ Verbessert - Mit Caching
     def verify_user_access(self, user_id: str, repo_id: str) -> bool:
-        """Prüfe User-Schreibrechte mit Caching"""
+        """Prüft User-Schreibrechte (mit Caching-Platzhalter)"""
         try:
             # Cache-Key für Zugriffsprüfung
             cache_key = f"access:{user_id}:{repo_id}"
@@ -152,7 +158,6 @@ class GitHubClient:
             logger.error(f"Permission-Check fehlgeschlagen: {e}")
             return False
     
-    # ✅ Verbessert - Mit Validierung und Fehlerbehandlung
     def create_atomic_commit(
         self,
         repo: Repository,
@@ -160,9 +165,9 @@ class GitHubClient:
         branch: str,
         message: str
     ) -> str:
-        """Erstelle atomaren Commit mit Rollback bei Fehler"""
+        """Erstellt atomaren Commit mit Rollback bei Fehlern"""
         
-        # ✅ NEU - Input Validierung
+        # Input Validierung
         if not changes:
             raise ValueError("Keine Änderungen bereitgestellt")
         
@@ -216,7 +221,7 @@ class GitHubClient:
                     logger.warning(f"⚠️ Leerer Inhalt für neue Datei: {file_path}")
                     new_content = "# Leere Datei\n"
                 
-                # ✅ NEU - Chunked Upload für große Dateien
+                # Chunked Upload für große Dateien
                 MAX_BLOB_SIZE = 10 * 1024 * 1024  # 10MB
                 if len(new_content) > MAX_BLOB_SIZE:
                     logger.warning(f"Große Datei erkannt: {file_path} ({len(new_content)} bytes)")
@@ -245,7 +250,7 @@ class GitHubClient:
                     f"{'✨ Erstelle' if action == 'create' else '✏️ Ändere'}: {file_path}"
                 )
             
-            # ✅ Prüfe auf tatsächliche Änderungen
+            # Prüfe auf tatsächliche Änderungen
             if not input_tree and not any(c.get("action") == "delete" for c in changes):
                 logger.warning("Keine Änderungen zum Committen")
                 return base_commit.sha

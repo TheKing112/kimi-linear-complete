@@ -35,7 +35,7 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# ✅ NEU - CORS Middleware hinzufügen
+# ✅ CORS Middleware hinzufügen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
@@ -89,7 +89,8 @@ user_request_times = defaultdict(list)
 # Konstanten
 EMBEDDING_DIM = 384  # Für all-MiniLM-L6-v2
 KNOWLEDGE_CONFIDENCE_THRESHOLD = 0.7
-ALLOWED_COLUMNS = {"created_at": "created_at", "updated_at": "updated_at", "id": "id"}
+# ✅ KORRIGIERT: Set statt Dict für direkte Spaltenvalidierung
+ALLOWED_COLUMNS = {"created_at", "updated_at", "id"}
 
 # Hilfsfunktionen
 def load_embeddings_model():
@@ -346,6 +347,14 @@ async def get_user_memories(
 ):
     """Hole Memories mit Pagination"""
     try:
+        # ✅ KORRIGIERT: Input validieren für Sets
+        order_by_clean = order_by.strip().lower()
+        if order_by_clean not in ALLOWED_COLUMNS:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid order_by column. Allowed: {', '.join(sorted(ALLOWED_COLUMNS))}"
+            )
+        
         async with db_pool.acquire() as conn:
             # Count total
             total = await conn.fetchval(
@@ -353,18 +362,12 @@ async def get_user_memories(
                 user_id
             )
             
-            # ✅ Sichere Spaltenauswahl via globales Dictionary
-            if order_by not in ALLOWED_COLUMNS:
-                raise HTTPException(status_code=400, detail="Invalid order_by column")
-            
-            order_column = ALLOWED_COLUMNS.get(order_by, "created_at")
-            
-            # Fetch page
+            # ✅ SICHER: Direkte Verwendung nach Validierung
             rows = await conn.fetch(f"""
                 SELECT id, content, metadata, created_at
                 FROM memories
                 WHERE user_id = $1
-                ORDER BY {order_column} DESC
+                ORDER BY {order_by_clean} DESC
                 LIMIT $2 OFFSET $3
             """, user_id, limit, offset)
         
@@ -388,6 +391,8 @@ async def get_user_memories(
             }
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Abrufen fehlgeschlagen: {e}")
         raise HTTPException(status_code=500, detail=str(e))

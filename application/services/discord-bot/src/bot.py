@@ -155,20 +155,27 @@ class KimiBot(commands.Bot):
         logger.info("🌐 Health Check Server gestartet auf Port 8005")
         
     async def close(self):
-        """Aufräumen beim Herunterfahren"""
+        """Aufräumen beim Herunterfahren mit vollständiger Ressourcen-Freigabe"""
+        # HTTP Session schließen
         try:
             if self.session and not self.session.closed:
                 await self.session.close()
-                await asyncio.sleep(0.25)  # Warte auf Cleanup
-                logger.info("HTTP Session geschlossen")
+                # Warte auf asynchrone Cleanup-Operationen
+                await asyncio.sleep(0.5)
+                logger.info("✅ HTTP Session erfolgreich geschlossen")
         except Exception as e:
-            logger.error(f"Error closing session: {e}")
-        
-        # ✅ FIX: timeout=5 entfernt, wait=False für nicht-blockierenden Shutdown
-        if self.health_executor:
-            self.health_executor.shutdown(wait=False)
-            logger.info("Health server executor shutdown initiated")
-        
+            logger.error(f"❌ Fehler beim Schließen der HTTP Session: {e}")
+
+        # Health Server Executor herunterfahren
+        try:
+            if self.health_executor:
+                # Nicht-blockierend herunterfahren, da der Event Loop bereits stoppt
+                self.health_executor.shutdown(wait=False)
+                logger.info("✅ Health-Server Executor heruntergefahren")
+        except Exception as e:
+            logger.error(f"❌ Fehler beim Herunterfahren des Executors: {e}")
+
+        # Discord.py Cleanup
         await super().close()
 
 # ✅ NEU - Mit Lock für Thread-Safety

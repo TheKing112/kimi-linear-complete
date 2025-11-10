@@ -97,8 +97,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_pagination
 ON memories(user_id, created_at DESC, id DESC);
 
 -- ✅ NEU - Optimiertes Composite Index nur für autonome Memories
--- Hinweis: Ein simpler Index auf (is_autonomous) ist redundant, da dieser Index
--- alle notwendigen Queries abdeckt: user_id-Suche + Sortierung nach created_at
+-- Entfernt redundanten einfachen Index (falls vorhanden) und ersetzt ihn durch
+-- einen optimierten Composite Index für user_id-Suche + Sortierung nach created_at
+DROP INDEX IF EXISTS idx_memories_autonomous;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_autonomous_only
 ON memories(user_id, created_at DESC)
 WHERE is_autonomous = true;
@@ -314,7 +315,7 @@ DELETE FROM knowledge_graph
 WHERE id NOT IN (
     SELECT DISTINCT ON (user_id, subject, predicate, object) id
     FROM knowledge_graph
-    ORDER BY user_id, subject, predicate, object, confidence DESC, created_at DESC
+    ORDER BY user_id, subject, predicate, object, confidence DESC, added_at DESC
 );
 
 -- 3. Dann UNIQUE CONSTRAINT hinzufügen (falls noch nicht vorhanden)
