@@ -15,7 +15,7 @@ class RedisClient:
     """Singleton Redis client for distributed locking and request deduplication."""
     
     _instance = None
-    _lock = None
+    _lock = asyncio.Lock()  # ✅ Auf Klassenebene definieren
     _initialized = False
     
     def __new__(cls):
@@ -32,10 +32,6 @@ class RedisClient:
         if self.__class__._initialized:
             logger.debug("Redis client already initialized.")
             return
-        
-        # Lazy lock initialization to avoid event loop issues at import time
-        if self.__class__._lock is None:
-            self.__class__._lock = asyncio.Lock()
         
         async with self.__class__._lock:
             # Double-check pattern for thread safety
@@ -68,9 +64,13 @@ class RedisClient:
             except Exception as e:
                 # Cleanup on failure
                 if client:
-                    await client.close()
+                    try:
+                        await client.close()
+                        await client.connection_pool.disconnect()
+                    except Exception as cleanup_err:
+                        logger.warning(f"Error during cleanup: {cleanup_err}")
                 logger.error(f"Failed to initialize Redis client: {e}")
-                raise
+                raise RuntimeError("Redis initialization failed") from e
     
     async def close(self) -> None:
         """Explicit cleanup method for Redis client."""

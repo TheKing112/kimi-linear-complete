@@ -149,7 +149,7 @@ class AutonomousApprovalView(View):
             await interaction.response.send_message("❌ Nicht autorisiert", ephemeral=True)
             return
         
-        await interaction.response.send_message("🚀 Starte autonome Bearbeitung...", ephemeral=True)
+        await interaction.response.send_message("🚀 Startet autonome Bearbeitung...", ephemeral=True)
         
         try:
             result = await process_autonomous_edit(self.repo_url, self.prompt, str(interaction.user.id))
@@ -267,6 +267,12 @@ class RateLimiter:
     
     def reset(self, user_id: str):
         self.requests.pop(user_id, None)
+
+# ✅ NEU: Rate Limiter Instanz
+rate_limiter = RateLimiter(max_requests=10, window=60)
+
+# ✅ NEU: Timeout-Import für eindeutige Fehlerbehandlung
+from asyncio import TimeoutError as AsyncTimeoutError  # Für eindeutige Timeouts
 
 # ✅ NEU: Spezifische Error Codes
 class BotError(Exception):
@@ -425,7 +431,7 @@ async def generate_with_kimi(
                     else:
                         logger.error(f"Kimi API error: {resp.status}")
                         return None
-            except asyncio.TimeoutError:
+            except AsyncTimeoutError:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
                     logger.warning(f"Timeout, retry in {delay}s...")
@@ -449,10 +455,9 @@ async def generate_with_kimi(
         logger.error(f"Generation failed: {e}")
         return None
     finally:
-        # ✅ Cleanup garantiert
+        # ✅ Don't close session - managed by bot lifecycle
         if session and hasattr(session, '_connector'):
             await asyncio.sleep(0.250)  # Connection pool cleanup
-            # Don't close session as it's managed by bot
 
 async def store_memory(user_id: str, content: str, prompt: str, tokens: int, guild_id: Optional[str]):
     """Speichere generierten Code in Cognee"""

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from .github_client import GitHubClient
 from .repo_analyzer import RepositoryAnalyzer
 from .webhook_handler import WebhookHandler
+from .redis_client import RedisClient
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -88,11 +89,22 @@ class WebhookPayload(BaseModel):
 github_client: Optional[GitHubClient] = None
 analyzer: Optional[RepositoryAnalyzer] = None
 webhook_handler: Optional[WebhookHandler] = None
+redis_client: Optional[Any] = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialisiere GitHub Integration"""
-    global github_client, analyzer, webhook_handler
+    """Initialisiere GitHub Integration mit Redis"""
+    global github_client, analyzer, webhook_handler, redis_client
+    
+    # ✅ Redis initialisieren
+    try:
+        redis_client = RedisClient()
+        await redis_client.initialize()
+        logger.info("✅ Redis Client initialisiert")
+    except Exception as e:
+        logger.error(f"❌ Redis Initialisierung fehlgeschlagen: {e}")
+        # Redis ist optional für den Betrieb, daher nicht abbrechen
+        # Wenn Redis obligatorisch ist: raise e
     
     github_token = os.getenv("GITHUB_TOKEN")
     if not github_token:
@@ -156,7 +168,7 @@ def verify_webhook_signature(payload: bytes, signature: str) -> bool:
 
 @app.post("/webhook/github")
 async def github_webhook(
-    request: Request,  # ✅ Changed to Request
+    request: Request,
     x_github_event: Optional[str] = Header(None),
     x_hub_signature_256: Optional[str] = Header(None)
 ):
@@ -191,7 +203,7 @@ async def github_webhook(
 async def health_check():
     """Health Check mit einheitlichem Format und tieferen Prüfungen"""
     try:
-        global github_client, analyzer
+        global github_client, analyzer, redis_client
         
         # Prüfe GitHub Auth & Rate Limit
         github_healthy = False
@@ -203,6 +215,15 @@ async def health_check():
         
         # Prüfe Analyzer
         analyzer_healthy = analyzer is not None
+        
+        # ✅ Prüfe Redis
+        redis_healthy = False
+        if redis_client:
+            try:
+                redis_healthy = await redis_client.ping()
+            except Exception as e:
+                logger.error(f"Redis health check failed: {e}")
+                redis_healthy = False
         
         # Bestimme Gesamt-Status
         if github_healthy and analyzer_healthy:
@@ -220,7 +241,8 @@ async def health_check():
             "dependencies": {
                 "github_api": github_healthy,
                 "repository_analyzer": analyzer_healthy,
-                "authenticated": github_client.is_authenticated() if github_client else False
+                "authenticated": github_client.is_authenticated() if github_client else False,
+                "redis": redis_healthy  # ✅ Redis health status
             },
             "metrics": {
                 "rate_limit": rate_limit_info,
@@ -243,5 +265,5 @@ async def root():
     return {
         "service": "GitHub Integration API",
         "version": "1.0.0",
-        "features": ["repo-cloning", "auto-analysis", "webhooks", "cognee-sync"]
+        "features": ["repo-cloning", "auto-analysis", "webhooks", "cognee-sync", "redis-cache"]
     }

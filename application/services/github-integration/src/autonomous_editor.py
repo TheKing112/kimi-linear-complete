@@ -46,6 +46,7 @@ class AutonomousEditor:
         # 🆔 UUID-Branch-Namen - Setup
         self.timeout = timeout
         self.latency_tracker = {}
+        self._max_tracker_entries = 1000  # Limit
         
         # 🔗 URL-Validierung in __init__
         self._validate_github_url(github_url)
@@ -53,6 +54,10 @@ class AutonomousEditor:
         
         # Redis-Client mit Timeout-Handling
         self.redis_client = redis_client  # ✅
+        
+        # ✅ Validate Redis is initialized
+        if not hasattr(redis_client, 'client') or not redis_client._initialized:
+            raise RuntimeError("Redis client must be initialized before use")
         
         # HTTP Session für persistente Verbindungen
         self._session: Optional[aiohttp.ClientSession] = None
@@ -294,6 +299,14 @@ class AutonomousEditor:
                 {"timeout": True}
             )
 
+    def _cleanup_tracker(self):
+        """Cleanup old latency entries"""
+        if len(self.latency_tracker) > self._max_tracker_entries:
+            # Keep only last 100 entries
+            items = sorted(self.latency_tracker.items(), 
+                          key=lambda x: x[1].get('timestamp', 0))
+            self.latency_tracker = dict(items[-100:])
+
     async def _process_internal(
         self,
         prompt: str,
@@ -387,7 +400,11 @@ class AutonomousEditor:
                 
         except Exception as e:
             # Fehler mit Latency-Tracking zurückgeben
-            return self._enhance_error(e, start_time, operation_metrics)  # 'return' statt 'raise'
+            error_info = self._enhance_error(e, start_time, operation_metrics)
+            return {
+                "status": "error",
+                **error_info
+            }
 
     def _get_latency_ms(self, start_time: float) -> float:
         """⏱️ Latency in Millisekunden berechnen"""

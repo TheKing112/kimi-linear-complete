@@ -2,7 +2,7 @@ import os
 import logging
 import json
 import re
-import asyncio  # ✅ NEU - Für RateLimiter
+import asyncio
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from functools import wraps
@@ -11,15 +11,13 @@ from time import time
 
 import asyncpg
 import numpy as np
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
 from sentence_transformers import SentenceTransformer
-import networkx as nx
 from asyncpg.exceptions import UniqueViolationError
 from fastapi.middleware.cors import CORSMiddleware
-import aiofiles
 
-# Logging
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cognee")
 
@@ -29,7 +27,7 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# ✅ CORS Middleware hinzufügen
+# CORS Middleware configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
@@ -52,7 +50,7 @@ class MemoryRequest(BaseModel):
     
     @validator('metadata')
     def validate_metadata(cls, v):
-        # Verhindere zu große metadata
+        # Prevent oversized metadata (max 10KB when serialized)
         if len(json.dumps(v)) > 10000:
             raise ValueError('Metadata too large (max 10KB)')
         return v
@@ -77,48 +75,77 @@ class UserMemoriesResponse(BaseModel):
 embeddings_model: Optional[SentenceTransformer] = None
 db_pool: Optional[asyncpg.Pool] = None
 
-# Konstanten
-EMBEDDING_DIM = 384  # Für all-MiniLM-L6-v2
+# Configuration constants
+EMBEDDING_DIM = 384  # Dimension for all-MiniLM-L6-v2 model
 KNOWLEDGE_CONFIDENCE_THRESHOLD = 0.7
 
-# ✅ KORRIGIERT: Prepared Statement Sicherheit mit Query Mapping
+# Rate limiting configuration
+RATE_LIMIT_MAX_REQUESTS = 100
+RATE_LIMIT_WINDOW = 60  # seconds
+
+# Whitelisted ORDER BY clauses to prevent SQL injection
+# Each key maps to a validated ORDER BY clause
 ALLOWED_ORDERS = {
     'created_at': 'created_at DESC',
     'updated_at': 'updated_at DESC',
     'id': 'id DESC'
 }
 
-# Hilfsfunktionen
 def load_embeddings_model():
-    """Lade Sentence-Transformer Modell"""
+    """
+    Load the SentenceTransformer model for generating text embeddings.
+    Model name is configured via EMBEDDINGS_MODEL environment variable.
+    """
     global embeddings_model
     
     model_name = os.getenv("EMBEDDINGS_MODEL", "all-MiniLM-L6-v2")
-    logger.info(f"Lade Embeddings-Modell: {model_name}")
+    logger.info(f"Loading embeddings model: {model_name}")
     
     embeddings_model = SentenceTransformer(model_name)
-    logger.info("Embeddings-Modell geladen")
+    logger.info("Embeddings model loaded successfully")
 
 def generate_embedding(text: str) -> List[float]:
-    """Generiere Embedding für Text"""
+    """
+    Generate vector embedding for the given text.
+    Returns a list of floats (dimension depends on model).
+    """
     if embeddings_model is None:
-        raise RuntimeError("Embeddings-Modell nicht geladen")
+        raise RuntimeError("Embeddings model not loaded")
     
+    # Generate embedding as numpy array, then convert to list for database storage
     embedding = embeddings_model.encode(text, convert_to_tensor=False)
     return embedding.tolist()
 
-# ✅ NEU - Thread-sichere RateLimiter Klasse
 class RateLimiter:
+    """
+    Thread-safe rate limiter using sliding window algorithm.
+    Tracks requests per endpoint and user separately.
+    """
     def __init__(self):
+        # Store request timestamps per rate key (endpoint:user)
         self.requests = defaultdict(list)
+        # Use separate locks per rate key for concurrency safety
         self._locks = defaultdict(asyncio.Lock)
     
     async def is_allowed(self, key: str, endpoint: str, max_requests: int, window: int) -> bool:
+        """
+        Check if a request should be allowed based on rate limits.
+        
+        Args:
+            key: Unique identifier for the user/client
+            endpoint: Function name of the endpoint
+            max_requests: Maximum requests allowed in the window
+            window: Time window in seconds
+        
+        Returns:
+            True if request is allowed, False if rate limit exceeded
+        """
         rate_key = f"{endpoint}:{key}"
         
         async with self._locks[rate_key]:
             now = time()
             user_times = self.requests[rate_key]
+            # Remove timestamps outside the current window (sliding window cleanup)
             user_times[:] = [t for t in user_times if now - t < window]
             
             if len(user_times) >= max_requests:
@@ -130,18 +157,22 @@ class RateLimiter:
 # Global rate limiter instance
 rate_limiter = RateLimiter()
 
-def rate_limit(max_requests: int = 10, window: int = 60):
-    """Rate limiting decorator pro User"""
+def rate_limit(max_requests: int = RATE_LIMIT_MAX_REQUESTS, window: int = RATE_LIMIT_WINDOW):
+    """
+    Decorator to apply rate limiting to FastAPI endpoints.
+    Assumes the first argument is a Pydantic request model with a user_id field.
+    """
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
+            # Extract request object (first argument for FastAPI endpoints)
             request = kwargs.get('request') or args[0]
             user_id = request.user_id
             
             if not await rate_limiter.is_allowed(user_id, func.__name__, max_requests, window):
                 raise HTTPException(
                     status_code=429,
-                    detail=f"Rate limit: {max_requests} requests per {window}s"
+                    detail=f"Rate limit exceeded: {max_requests} requests per {window}s allowed"
                 )
             
             return await func(*args, **kwargs)
@@ -149,49 +180,41 @@ def rate_limit(max_requests: int = 10, window: int = 60):
     return decorator
 
 async def init_database():
-    """Initialisiere Datenbank und erstelle Tabellen"""
+    """
+    Initialize database connection pool and create necessary tables.
+    Connection pool is configured for production use with reasonable limits.
+    """
     global db_pool
     
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
-        raise ValueError("DATABASE_URL nicht gesetzt")
+        raise ValueError("DATABASE_URL environment variable not set")
     
-    # ✅ RICHTIG - Skalierbarer Connection Pool mit Error Handling
+    # Create connection pool with production-ready settings
     try:
         db_pool = await asyncpg.create_pool(
             db_url,
-            min_size=5,
-            max_size=50,
-            command_timeout=60,
-            max_queries=50000,
-            max_inactive_connection_lifetime=300,
+            min_size=5,  # Minimum idle connections
+            max_size=20,  # Maximum connections (realistic for most setups)
+            command_timeout=60,  # Timeout for individual commands
+            max_queries=50000,  # Max queries per connection before recycling
+            max_inactive_connection_lifetime=300,  # Recycle idle connections after 5 minutes
             server_settings={
-                'application_name': 'cognee-memory-api'
+                'application_name': 'cognee-memory-api',
+                'statement_timeout': '60000'  # 60s statement timeout at server level
             }
         )
+        logger.info("Database connection pool created successfully")
     except Exception as e:
         logger.error(f"Failed to create database pool: {e}")
         raise RuntimeError("Database connection failed") from e
     
-    # Erstelle Tabellen
+    # Create tables and indexes
     async with db_pool.acquire() as conn:
-        # Aktiviere pgvector
+        # Enable pgvector extension for vector operations
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         
-        # Memories Tabelle
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS memories (
-                id SERIAL PRIMARY KEY,
-                user_id VARCHAR(255) NOT NULL,
-                content TEXT NOT NULL,
-                embedding vector($1),
-                metadata JSONB DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """, EMBEDDING_DIM)
-        
-        # Knowledge Graph Tabelle
+        # Create knowledge_graph table with unique constraint first
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_graph (
                 id SERIAL PRIMARY KEY,
@@ -200,87 +223,120 @@ async def init_database():
                 predicate TEXT NOT NULL,
                 object TEXT NOT NULL,
                 confidence FLOAT DEFAULT 0.8,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, subject, predicate, object)
             )
         """)
         
-        # Indizes
+        # Main memories table for storing text content and embeddings
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                content TEXT NOT NULL,
+                embedding vector($1),  -- Vector for semantic search
+                metadata JSONB DEFAULT '{}',  -- Flexible metadata storage
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """, EMBEDDING_DIM)
+        
+        # Create indexes for performance
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_user_id ON memories(user_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_user ON knowledge_graph(user_id)")
         
-        logger.info("Datenbank-Tabellen erstellt")
+        logger.info("Database tables and indexes created successfully")
 
-# ✅ NEU - Transaction-aware Version
 async def extract_knowledge_transactional(
     conn: asyncpg.Connection,
     content: str,
     user_id: str
 ) -> None:
-    """Extrahiere Wissen mit Transaction-Support - wird von allen schreibenden Endpoints genutzt"""
+    """
+    Extract knowledge from code content and store in knowledge graph.
+    This function is designed to be run inside a transaction.
+    
+    Extracts:
+    - Function definitions
+    - Class definitions
+    - Library imports
+    
+    Each extraction is stored as a (subject, predicate, object) triple with confidence score.
+    Uses UPSERT to update confidence if the triple already exists.
+    """
     try:
+        # Use regex to extract code elements
         functions = re.findall(r'def (\w+)\s*\(', content)
         classes = re.findall(r'class (\w+)', content)
         imports = re.findall(r'^(?:import|from)\s+(\w+)', content, re.MULTILINE)
         
-        # Batch Insert für Performance
+        # Prepare batch insert for performance
         knowledge_records = []
         
         for func in functions:
-            knowledge_records.append(
-                (user_id, f"user_{user_id}", 'defines_function', func, 0.9)
-            )
+            knowledge_records.append((user_id, f"user_{user_id}", 'defines_function', func, 0.9))
         
         for cls in classes:
-            knowledge_records.append(
-                (user_id, f"user_{user_id}", 'defines_class', cls, 0.9)
-            )
+            knowledge_records.append((user_id, f"user_{user_id}", 'defines_class', cls, 0.9))
         
         for imp in imports:
-            knowledge_records.append(
-                (user_id, f"user_{user_id}", 'imports_library', imp, 0.7)
-            )
+            knowledge_records.append((user_id, f"user_{user_id}", 'imports_library', imp, 0.7))
         
+        # Bulk upsert knowledge triples using UNNEST for asyncpg compatibility
+        # ON CONFLICT DO UPDATE sets confidence to the higher value and updates timestamp
         if knowledge_records:
-            await conn.executemany("""
+            await conn.execute("""
                 INSERT INTO knowledge_graph 
                 (user_id, subject, predicate, object, confidence)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT DO NOTHING
-            """, knowledge_records)
+                SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::float[])
+                ON CONFLICT (user_id, subject, predicate, object)
+                DO UPDATE SET 
+                    confidence = GREATEST(knowledge_graph.confidence, EXCLUDED.confidence),
+                    created_at = CURRENT_TIMESTAMP
+            """, 
+                [r[0] for r in knowledge_records],  # user_id
+                [r[1] for r in knowledge_records],  # subject
+                [r[2] for r in knowledge_records],  # predicate
+                [r[3] for r in knowledge_records],  # object
+                [r[4] for r in knowledge_records]   # confidence
+            )
             
     except Exception as e:
-        logger.warning(f"Wissens-Extraktion fehlgeschlagen: {e}")
-        raise  # Re-raise für Transaction Rollback
+        logger.warning(f"Knowledge extraction failed: {e}")
+        raise  # Re-raise to trigger transaction rollback
 
 # API Endpoints
 @app.on_event("startup")
 async def startup_event():
-    """Starte Event: Lade Modelle und DB"""
+    """Application startup: load models and initialize database"""
     try:
         load_embeddings_model()
         await init_database()
-        logger.info("Cognee erfolgreich gestartet")
+        logger.info("Cognee API started successfully")
     except Exception as e:
-        logger.error(f"Startup fehlgeschlagen: {e}")
+        logger.error(f"Startup failed: {e}")
         raise
 
-# ✅ RICHTIG - Mit Transaction und Rate Limiting
 @app.post("/memory/store", status_code=201)
 @rate_limit(max_requests=100, window=60)
 async def store_memory(request: MemoryRequest):
-    """Speichere Memory atomar mit Knowledge Graph"""
-    # ✅ Embedding außerhalb Transaction generieren (Read-Only Operation)
+    """
+    Store a memory atomically with knowledge graph extraction.
+    Embedding is generated before the transaction to minimize DB lock time.
+    """
+    # Generate embedding outside transaction (read-only, potentially slow)
     try:
         embedding = generate_embedding(request.content)
     except Exception as e:
         logger.error(f"Embedding generation failed: {e}")
         raise HTTPException(status_code=400, detail=f"Embedding generation failed: {e}")
     
+    # Store memory and knowledge in a single transaction
     try:
         async with db_pool.acquire() as conn:
-            async with conn.transaction():  # ✅ Transaction
-                # Speichere Memory
+            async with conn.transaction():
+                # Insert memory record
                 row = await conn.fetchrow("""
                     INSERT INTO memories (user_id, content, embedding, metadata)
                     VALUES ($1, $2, $3, $4)
@@ -290,12 +346,12 @@ async def store_memory(request: MemoryRequest):
                 memory_id = row['id']
                 created_at = row['created_at']
                 
-                # Extrahiere und speichere Knowledge im selben Transaction
+                # Extract and store knowledge in same transaction
                 await extract_knowledge_transactional(
                     conn, request.content, request.user_id
                 )
         
-        logger.info(f"Memory gespeichert (ID: {memory_id})")
+        logger.info(f"Memory stored successfully (ID: {memory_id})")
         
         return {
             "status": "success",
@@ -303,19 +359,22 @@ async def store_memory(request: MemoryRequest):
             "created_at": created_at.isoformat()
         }
     except Exception as e:
-        logger.error(f"Speichern fehlgeschlagen: {e}")
+        logger.error(f"Failed to store memory: {e}")
         raise HTTPException(status_code=500, detail="Failed to store memory")
 
 @app.get("/memory/search")
 async def search_memory(query: str, user_id: Optional[str] = None, limit: int = 10):
-    """Semantic Suche in Memories"""
+    """
+    Perform semantic search across memories using vector similarity.
+    Results are ordered by cosine similarity (converted to distance for pgvector).
+    """
     try:
-        logger.info(f"Suche nach: {query[:50]}...")
+        logger.info(f"Searching for: {query[:50]}...")
         
-        # Generiere Query-Embedding
+        # Generate query embedding
         query_embedding = generate_embedding(query)
         
-        # Suche in DB
+        # Search in database using pgvector cosine similarity
         async with db_pool.acquire() as conn:
             if user_id:
                 rows = await conn.fetch("""
@@ -335,7 +394,7 @@ async def search_memory(query: str, user_id: Optional[str] = None, limit: int = 
                     LIMIT $2
                 """, query_embedding, limit)
         
-        # ✅ NACHHER - Bulk fetch mit List Comprehension
+        # Convert to response objects
         memories = [
             MemoryResponse(
                 id=row['id'],
@@ -347,15 +406,14 @@ async def search_memory(query: str, user_id: Optional[str] = None, limit: int = 
             for row in rows
         ]
         
-        logger.info(f"{len(memories)} Memories gefunden")
+        logger.info(f"Found {len(memories)} memories")
         
         return {"memories": [m.dict() for m in memories], "query": query}
         
     except Exception as e:
-        logger.error(f"Suche fehlgeschlagen: {e}")
+        logger.error(f"Search failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ✅ RICHTIG - Mit Pagination und SQL Injection Fix
 @app.get("/memory/user/{user_id}")
 async def get_user_memories(
     user_id: str,
@@ -363,9 +421,12 @@ async def get_user_memories(
     offset: int = 0,
     order_by: str = "created_at"
 ):
-    """Hole Memories mit Pagination"""
+    """
+    Retrieve paginated memories for a specific user.
+    Safe ORDER BY implementation prevents SQL injection.
+    """
     try:
-        # ✅ KORRIGIERT: Prepared Statement Sicherheit mit Query Mapping
+        # Validate order_by parameter against whitelist
         order_clause = ALLOWED_ORDERS.get(order_by.strip().lower())
         if not order_clause:
             raise HTTPException(
@@ -374,13 +435,14 @@ async def get_user_memories(
             )
 
         async with db_pool.acquire() as conn:
-            # Count total
+            # Get total count for pagination metadata
             total = await conn.fetchval(
                 "SELECT COUNT(*) FROM memories WHERE user_id = $1",
                 user_id
             )
             
-            # ✅ SICHER: Separate Prepared Statements für jede Sortierung
+            # Use separate prepared statements for each allowed ordering
+            # This maintains prepared statement safety while supporting multiple sort options
             if order_clause == 'created_at DESC':
                 rows = await conn.fetch("""
                     SELECT id, content, metadata, created_at
@@ -405,24 +467,17 @@ async def get_user_memories(
                     ORDER BY id DESC
                     LIMIT $2 OFFSET $3
                 """, user_id, limit, offset)
-            else:
-                # Fallback, sollte nicht passieren
-                rows = await conn.fetch("""
-                    SELECT id, content, metadata, created_at
-                    FROM memories
-                    WHERE user_id = $1
-                    ORDER BY created_at DESC
-                    LIMIT $2 OFFSET $3
-                """, user_id, limit, offset)
         
-        memories = []
-        for row in rows:
-            memories.append({
+        # Build response
+        memories = [
+            {
                 "id": row['id'],
                 "content": row['content'],
                 "metadata": row['metadata'],
                 "created_at": row['created_at'].isoformat()
-            })
+            }
+            for row in rows
+        ]
         
         return {
             "user_id": user_id,
@@ -438,12 +493,12 @@ async def get_user_memories(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Abrufen fehlgeschlagen: {e}")
+        logger.error(f"Failed to retrieve memories: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/memory/{memory_id}")
 async def delete_memory(memory_id: int):
-    """Lösche Memory"""
+    """Delete a specific memory by ID"""
     try:
         async with db_pool.acquire() as conn:
             result = await conn.execute(
@@ -451,20 +506,20 @@ async def delete_memory(memory_id: int):
             )
             
             if result == "DELETE 0":
-                raise HTTPException(status_code=404, detail="Memory nicht gefunden")
+                raise HTTPException(status_code=404, detail="Memory not found")
         
-        logger.info(f"Memory {memory_id} gelöscht")
+        logger.info(f"Memory {memory_id} deleted successfully")
         return {"status": "deleted", "memory_id": memory_id}
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Löschen fehlgeschlagen: {e}")
+        logger.error(f"Failed to delete memory: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/knowledge-graph/{user_id}")
 async def get_knowledge_graph(user_id: str):
-    """Hole Knowledge Graph für User"""
+    """Retrieve knowledge graph edges for a specific user"""
     try:
         async with db_pool.acquire() as conn:
             rows = await conn.fetch("""
@@ -474,27 +529,31 @@ async def get_knowledge_graph(user_id: str):
                 ORDER BY confidence DESC, created_at DESC
             """, user_id)
         
-        edges = []
-        for row in rows:
-            edges.append({
+        edges = [
+            {
                 "subject": row['subject'],
                 "predicate": row['predicate'],
                 "object": row['object'],
                 "confidence": row['confidence'],
                 "created_at": row['created_at'].isoformat()
-            })
+            }
+            for row in rows
+        ]
         
         return {"user_id": user_id, "edges": edges}
         
     except Exception as e:
-        logger.error(f"Knowledge Graph fehlgeschlagen: {e}")
+        logger.error(f"Knowledge graph retrieval failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
-    """Health Check mit einheitlichem Format"""
+    """
+    Comprehensive health check endpoint.
+    Checks database connectivity and model loading status.
+    """
     try:
-        # Prüfe Datenbankverbindung
+        # Check database connection
         db_status = db_pool is not None
         if db_pool:
             async with db_pool.acquire() as conn:
@@ -513,8 +572,8 @@ async def health_check():
             "metrics": {
                 "embedding_dim": EMBEDDING_DIM,
                 "model_name": os.getenv("EMBEDDINGS_MODEL", "all-MiniLM-L6-v2"),
-                "rate_limit_window": "60s",
-                "rate_limit_max": 100
+                "rate_limit_window": f"{RATE_LIMIT_WINDOW}s",
+                "rate_limit_max": RATE_LIMIT_MAX_REQUESTS
             }
         }
     except Exception as e:
@@ -529,7 +588,7 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    """Root Endpoint"""
+    """API root endpoint with service information"""
     return {
         "service": "Cognee Memory API",
         "version": "2.0.0",

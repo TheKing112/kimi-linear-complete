@@ -177,6 +177,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    shm_size: 16gb  # Ausreichend für Sparse Activation
     environment:
       - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
       - KIMI_URL=http://kimi-linear:8003

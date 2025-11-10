@@ -29,20 +29,24 @@ readonly ZONES=("us-east1-b" "us-east1-c" "us-central1-a" "us-central1-b" "us-we
 ZONE=""
 
 # ===== TRAP & CLEANUP =====
-# ✅ Comprehensive cleanup function
+# ✅ COMPREHENSIVE CLEANUP FUNCTION
 cleanup_partial_setup() {
-    local zone="$1"
+    local zone="${1:-}"
     
     log "Cleaning up partial setup..."
     
-    # Remove VM if exists
-    if [ -n "$VM_NAME" ] && [ -n "$zone" ]; then
-        gcloud compute instances delete "$VM_NAME" \
-            --zone="$zone" \
-            --quiet 2>/dev/null || true
+    # Remove VM if exists (requires zone)
+    if [ -n "$VM_NAME" ]; then
+        if [ -n "$zone" ]; then
+            gcloud compute instances delete "$VM_NAME" \
+                --zone="$zone" \
+                --quiet 2>/dev/null || true
+        else
+            warn "No zone specified, skipping VM deletion"
+        fi
     fi
     
-    # Remove firewall rules
+    # Remove firewall rules (global, not zone-specific)
     local rules=("allow-http" "allow-https" "allow-ssh" "allow-custom-ports")
     for rule in "${rules[@]}"; do
         gcloud compute firewall-rules delete "kimi-$rule" \

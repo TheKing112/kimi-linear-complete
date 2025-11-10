@@ -34,9 +34,9 @@ ALLOWED_DOCKER_COMMANDS = {
 }
 
 class RemoteControl(commands.Cog):
-    def __init__(self, bot):
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self.control_channel = None
+        self.control_channel: Optional[discord.TextChannel] = None
         self.allowed_users: Set[int] = set()
         self._session: Optional[aiohttp.ClientSession] = None
         self.status_monitor.start()
@@ -49,7 +49,7 @@ class RemoteControl(commands.Cog):
         return self._session
 
     @commands.Cog.listener()
-    async def on_ready(self):
+    async def on_ready(self) -> None:
         """Bot ist bereit - initialisiere Remote Control"""
         try:
             allowed_ids = os.getenv("DISCORD_CONTROL_USERS", "").split(",")
@@ -74,7 +74,7 @@ class RemoteControl(commands.Cog):
         """Prüfe ob User Remote-Control darf"""
         return user_id in self.allowed_users or str(user_id) == os.getenv("DISCORD_OWNER_ID")
 
-    async def cog_before_invoke(self, ctx: commands.Context):
+    async def cog_before_invoke(self, ctx: commands.Context) -> bool:
         """Prüfe Authentifizierung vor jedem Command"""
         if not self.is_authorized(ctx.author.id):
             raise commands.CheckFailure("❌ Keine Berechtigung für Remote-Control")
@@ -82,7 +82,7 @@ class RemoteControl(commands.Cog):
 
     # ===== BASIS COMMANDS =====
     @commands.command(name='vmstart')
-    async def vm_start(self, ctx: commands.Context):
+    async def vm_start(self, ctx: commands.Context) -> None:
         """Starte komplette Kimi Linear Engine"""
         async with ctx.typing():
             try:
@@ -103,7 +103,7 @@ class RemoteControl(commands.Cog):
                 await ctx.send(f"❌ Start fehlgeschlagen: {str(e)}")
 
     @commands.command(name='vmstop')
-    async def vm_stop(self, ctx: commands.Context):
+    async def vm_stop(self, ctx: commands.Context) -> None:
         """Stoppe alle Services"""
         async with ctx.typing():
             try:
@@ -121,7 +121,7 @@ class RemoteControl(commands.Cog):
                 await ctx.send(f"❌ Stop fehlgeschlagen: {str(e)}")
 
     @commands.command(name='vmstatus')
-    async def vm_status(self, ctx: commands.Context):
+    async def vm_status(self, ctx: commands.Context) -> None:
         """Zeige kompletten VM-Status"""
         async with ctx.typing():
             try:
@@ -156,7 +156,7 @@ class RemoteControl(commands.Cog):
 
     # ===== ERWEITERTE COMMANDS =====
     @commands.command(name='vmservices')
-    async def vm_services(self, ctx: commands.Context, action: str = "list", service: str = None):
+    async def vm_services(self, ctx: commands.Context, action: str = "list", service: Optional[str] = None) -> None:
         """Verwalte einzelne Services (start/stop/restart/list/logs)"""
         actions = ["start", "stop", "restart", "list", "logs"]
         
@@ -213,7 +213,7 @@ class RemoteControl(commands.Cog):
             await ctx.send(f"❌ Fehlgeschlagen: {str(e)}")
 
     @commands.command(name='vmconfig')
-    async def vm_config(self, ctx: commands.Context, key: str = None, value: str = None):
+    async def vm_config(self, ctx: commands.Context, key: Optional[str] = None, value: Optional[str] = None) -> None:
         """Zeige oder ändere VM-Konfiguration"""
         async with ctx.typing():
             try:
@@ -256,7 +256,7 @@ class RemoteControl(commands.Cog):
                 await ctx.send(f"❌ Fehler: {str(e)}")
 
     @commands.command(name='vmmonitor')
-    async def vm_monitor(self, ctx: commands.Context, duration: int = 60):
+    async def vm_monitor(self, ctx: commands.Context, duration: int = 60) -> None:
         """Starte Live-Monitoring für X Sekunden"""
         if duration > 300:  # Max 5 Minuten
             await ctx.send("❌ Maximale Dauer: 300 Sekunden")
@@ -307,7 +307,7 @@ class RemoteControl(commands.Cog):
             await message.edit(embed=embed)
 
     @commands.command(name='vmauto')
-    async def vm_auto(self, ctx: commands.Context, action: str = "status"):
+    async def vm_auto(self, ctx: commands.Context, action: str = "status") -> None:
         """Verwalte automatische Neustarts/Monitoring"""
         action = action.lower()
         
@@ -330,7 +330,7 @@ class RemoteControl(commands.Cog):
             await ctx.send(f"📊 Auto-Monitoring: {status}")
 
     @tasks.loop(minutes=5)
-    async def status_monitor(self):
+    async def status_monitor(self) -> None:
         """Automatischer Status-Check alle 5 Minuten"""
         if not self.control_channel:
             return
@@ -364,7 +364,7 @@ class RemoteControl(commands.Cog):
             gc.collect()
 
     @status_monitor.before_loop
-    async def before_status_monitor(self):
+    async def before_status_monitor(self) -> None:
         await self.bot.wait_until_ready()
 
     # ===== TECHNISCHE FUNKTIONEN =====
@@ -661,13 +661,13 @@ class RemoteControl(commands.Cog):
             logger.error(f"Fehler beim Lesen der Configs: {e}")
             return {"Fehler": "Konnte .env nicht lesen"}
 
-    async def cog_unload(self):
+    async def cog_unload(self) -> None:
         """Cleanup beim Unload"""
         self.status_monitor.stop()
         if self._session and not self._session.closed:
             await self._session.close()
 
 # Setup Funktion
-async def setup_remote_control(bot):
+async def setup_remote_control(bot: commands.Bot) -> None:
     """Füge Remote Control zum Bot hinzu"""
     await bot.add_cog(RemoteControl(bot))
