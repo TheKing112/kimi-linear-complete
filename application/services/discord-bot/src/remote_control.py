@@ -15,6 +15,10 @@ import os
 import time
 import logging
 import gc
+import tempfile
+import shutil
+import aiofiles
+from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Set
 import shlex
@@ -24,7 +28,6 @@ logger = logging.getLogger(__name__)
 # Konstanten
 COMPOSE_PATH = "/home/ubuntu/kimi-linear-complete/application"
 ALLOWED_DOCKER_ACTIONS = {"start", "stop", "restart"}
-# NEW: Konstante für erlaubte docker-compose Befehle
 ALLOWED_DOCKER_COMMANDS = {
     'up', 'down', 'restart', 'ps', 'logs', 
     'start', 'stop', 'config', 'exec'
@@ -365,7 +368,6 @@ class RemoteControl(commands.Cog):
         await self.bot.wait_until_ready()
 
     # ===== TECHNISCHE FUNKTIONEN =====
-    # NEW: Sichere Shell-Befehlsausführung für non-docker Befehle
     async def _safe_shell_command(
         self,
         cmd: List[str],
@@ -395,7 +397,6 @@ class RemoteControl(commands.Cog):
             logger.error(f"Command failed: {e}")
             raise
 
-    # MODIFIED: Sichere docker-compose Ausführung mit erweiterter Validierung
     async def _safe_docker_command(
         self,
         cmd: List[str],
@@ -565,7 +566,6 @@ class RemoteControl(commands.Cog):
 
     async def manage_service(self, action: str, service: str) -> Dict[str, Any]:
         """Verwalte einzelnen Service (start/stop/restart)"""
-        # ✅ Vereinfachte Validierung wie im Snippet vorgeschlagen
         if action not in ALLOWED_DOCKER_ACTIONS:
             raise ValueError(f"Ungültige Aktion: {action}")
         
@@ -595,28 +595,47 @@ class RemoteControl(commands.Cog):
         """Prüfe ob ein ENV-Schlüssel gültig ist (einfache Injection-Vermeidung)"""
         return bool(key) and all(c.isalnum() or c == '_' for c in key) and key.isupper()
 
-    # MODIFIED: Jetzt mit _safe_shell_command statt _safe_docker_command
     async def set_config(self, key: str, value: str) -> bool:
-        """Setze Config-Wert in .env"""
+        """Setze Config-Wert sicher mit atomarem File-Write"""
+        if not self._is_valid_env_key(key):
+            return False
+        
         try:
-            if not self._is_valid_env_key(key):
-                logger.warning(f"Ungültiger ENV-Schlüssel versucht: {key}")
-                return False
+            env_path = Path(COMPOSE_PATH) / ".env"
             
-            safe_value = shlex.quote(value)
-            check_result = await self._safe_shell_command(["grep", f"^{key}=", ".env"])
+            # Lese bestehende Config
+            async with aiofiles.open(env_path, 'r') as f:
+                lines = await f.readlines()
             
-            if check_result.returncode == 0:
-                result = await self._safe_shell_command(["sed", "-i", f"s/^{key}=.*/{key}={safe_value}/", ".env"])
-            else:
-                result = await self._safe_shell_command(["bash", "-c", f'echo "{key}={safe_value}" >> .env'])
+            # Update oder füge hinzu
+            found = False
+            new_lines = []
+            for line in lines:
+                if line.startswith(f"{key}="):
+                    new_lines.append(f"{key}={value}\n")
+                    found = True
+                else:
+                    new_lines.append(line)
             
-            return result.returncode == 0
+            if not found:
+                new_lines.append(f"{key}={value}\n")
+            
+            # Atomares Schreiben via temp file
+            with tempfile.NamedTemporaryFile(
+                mode='w', 
+                dir=COMPOSE_PATH, 
+                delete=False
+            ) as tmp:
+                tmp.writelines(new_lines)
+                tmp_path = tmp.name
+            
+            shutil.move(tmp_path, env_path)
+            return True
+            
         except Exception as e:
-            logger.error(f"Fehler beim Setzen der Config {key}={value}: {e}")
+            logger.error(f"Config write failed: {e}")
             return False
 
-    # MODIFIED: Jetzt mit _safe_shell_command statt _safe_docker_command
     async def get_config(self, key: str) -> str:
         """Hole Config-Wert aus .env"""
         try:
@@ -628,7 +647,6 @@ class RemoteControl(commands.Cog):
             logger.error(f"Fehler beim Lesen der Config {key}: {e}")
             return "Fehler beim Lesen"
 
-    # MODIFIED: Jetzt mit _safe_shell_command statt _safe_docker_command
     async def get_all_configs(self) -> Dict[str, str]:
         """Hole alle Configs"""
         try:

@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 # =============================================================================
 # KIMI LINEAR 48B - ONE-COMMAND VM SETUP
@@ -19,31 +18,47 @@ ok() { echo -e "${GREEN}✓${NC} $*"; }
 error() { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
 warn() { echo -e "${YELLOW}⚠${NC} $*"; }
 
-# ===== TRAP & CLEANUP =====
-trap cleanup_on_interrupt INT TERM
-
-cleanup_on_interrupt() {
-    warn "\n\n⚠️  Setup wurde abgebrochen!"
-    
-    read -p "VM löschen? [y/N] " -r
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        log "Lösche VM..."
-        gcloud compute instances delete "$VM_NAME" --quiet --zone=us-east1-b 2>/dev/null || true
-        ok "VM gelöscht"
-    else
-        warn "VM wurde erstellt, aber Setup unvollständig"
-        warn "Manuell löschen mit: gcloud compute instances delete $VM_NAME"
-    fi
-    
-    exit 130
-}
-
-# ===== CONFIGURATION =====
+# ===== GLOBAL VARIABLES =====
 readonly VM_NAME="kimi-linear-auto"
 readonly VM_TYPE="g2-standard-8"
 readonly GPU_TYPE="nvidia-l4"
 readonly DISK_SIZE="400GB"
 readonly ZONES=("us-east1-b" "us-east1-c" "us-central1-a" "us-central1-b" "us-west1-b")
+
+# Global zone variable - wird bei VM-Erstellung gesetzt
+ZONE=""
+
+# ===== TRAP & CLEANUP =====
+# ✅ Comprehensive cleanup function
+cleanup_partial_setup() {
+    local zone="$1"
+    
+    log "Cleaning up partial setup..."
+    
+    # Remove VM if exists
+    if [ -n "$VM_NAME" ] && [ -n "$zone" ]; then
+        gcloud compute instances delete "$VM_NAME" \
+            --zone="$zone" \
+            --quiet 2>/dev/null || true
+    fi
+    
+    # Remove firewall rules
+    local rules=("allow-http" "allow-https" "allow-ssh" "allow-custom-ports")
+    for rule in "${rules[@]}"; do
+        gcloud compute firewall-rules delete "kimi-$rule" \
+            --quiet 2>/dev/null || true
+    done
+    
+    # Remove SSH config
+    if [ -f ~/.ssh/config ]; then
+        sed -i '/# Kimi Linear VM/,/Port 22/d' ~/.ssh/config
+    fi
+    
+    ok "Cleanup complete"
+}
+
+# ✅ Enhanced trap
+trap 'cleanup_partial_setup "$ZONE"; exit 130' INT TERM
 
 # ===== VALIDATION =====
 # Repository URL - kann als Parameter oder Umgebungsvariable gesetzt werden
@@ -126,6 +141,9 @@ find_available_zone() {
 create_vm() {
     local zone
     zone=$(find_available_zone) || error "Keine GPU-Kapazität in allen Zonen verfügbar"
+    
+    # Set global ZONE for cleanup functions
+    ZONE="$zone"
     
     log "Erstelle VM in Zone: $zone"
     
@@ -357,4 +375,3 @@ EOF
 
 # ===== SCRIPT START =====
 main "$@"
-```

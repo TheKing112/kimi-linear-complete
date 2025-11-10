@@ -10,10 +10,9 @@ import shutil
 from github import Github, Repository, GithubException, RateLimitExceededException
 from git import Repo
 
-logger = logging.getLogger(__name__)  # ✅ FIX: Best Practice Logger-Name
+logger = logging.getLogger(__name__)
 
 
-# ✅ FIX: Alle Magic Numbers und Patterns zentral in Konfigurationsklasse
 class GitHubConfig:
     """Konfiguration für GitHub-Operationen"""
     CLONE_TIMEOUT = 600  # 10 Minuten
@@ -21,8 +20,8 @@ class GitHubConfig:
     MAX_BLOB_SIZE = 10 * 1024 * 1024  # 10MB
     MAX_COMMIT_MSG_LENGTH = 500
     ALLOWED_BRANCH_PATTERN = re.compile(r'^[a-zA-Z0-9/_-]+$')
-    ALLOWED_ACTIONS = {"create", "modify", "delete"}  # ✅ FIX: Whitelist statt String-Interpolation
-    ALLOWED_PERMISSIONS = {"write", "admin"}  # ✅ FIX: Explizite Berechtigungs-Whitelist
+    ALLOWED_ACTIONS = {"create", "modify", "delete"}
+    ALLOWED_PERMISSIONS = {"write", "admin"}
 
 
 class GitHubClient:
@@ -30,7 +29,7 @@ class GitHubClient:
         """Initialisiert GitHub-Client mit Token (optional)"""
         self.token = token or os.getenv("GITHUB_TOKEN")
         self.github = Github(self.token) if self.token else Github()
-        self.config = GitHubConfig()  # ✅ FIX: Konfiguration als Instanzattribut
+        self.config = GitHubConfig()
     
     def is_authenticated(self) -> bool:
         """Prüft, ob ein GitHub Token verfügbar ist"""
@@ -51,7 +50,6 @@ class GitHubClient:
         logger.info(f"Klonen {repo_id} (branch: {branch}) nach {tmp_dir}")
         
         try:
-            # ✅ FIX: Timeout und Depth aus Konfiguration lesen
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
                     Repo.clone_from,
@@ -69,7 +67,7 @@ class GitHubClient:
             logger.info(f"✅ Repository geklont nach {tmp_dir}")
             return tmp_dir
             
-        except Exception as e:  # ✅ FIX: Ein einziger except-Block mit Cleanup
+        except Exception as e:
             logger.error(f"Clone fehlgeschlagen: {e}")
             self._cleanup_tmp_dir(tmp_dir)
             raise
@@ -131,7 +129,7 @@ class GitHubClient:
                 time.sleep(wait_seconds)
                 total_wait += wait_seconds
             
-            except GithubException as e:  # ✅ FIX: Spezifischere Exception-Behandlung
+            except GithubException as e:
                 logger.error(f"GitHub API Fehler: {e}")
                 raise
             except Exception as e:
@@ -142,7 +140,7 @@ class GitHubClient:
     
     def verify_user_access(self, user_id: str, repo_id: str) -> bool:
         """Prüft User-Schreibrechte (mit Caching-Platzhalter)"""
-        CACHE_KEY_PREFIX = "access"  # ✅ FIX: Cache-Key als Konstante
+        CACHE_KEY_PREFIX = "access"
         cache_key = f"{CACHE_KEY_PREFIX}:{user_id}:{repo_id}"
         
         try:
@@ -151,13 +149,12 @@ class GitHubClient:
             
             permission = repo.get_collaborator_permission(user.login)
             
-            # ✅ FIX: Verwende ALLOWED_PERMISSIONS Set
             has_access = permission in self.config.ALLOWED_PERMISSIONS
             logger.info(f"User {user.login} hat {permission}-Zugriff auf {repo_id}")
             
             return has_access
         
-        except GithubException as e:  # ✅ FIX: Spezifische Exception
+        except GithubException as e:
             logger.error(f"Permission-Check fehlgeschlagen: {e}")
             return False
         except Exception as e:
@@ -176,17 +173,15 @@ class GitHubClient:
         if not changes:
             raise ValueError("Keine Änderungen bereitgestellt")
         
-        # ✅ FIX: Nutze konfigurierbare Länge
         if len(message) > self.config.MAX_COMMIT_MSG_LENGTH:
             raise ValueError(f"Commit-Nachricht zu lang (max. {self.config.MAX_COMMIT_MSG_LENGTH} Zeichen)")
         
-        # ✅ FIX: Branch-Validierung mit kompilierter Regex
         if not self.config.ALLOWED_BRANCH_PATTERN.match(branch):
             raise ValueError(f"Ungültiger Branch-Name: {branch}")
         
         try:
             repo.get_branch(branch)
-        except GithubException:  # ✅ FIX: Spezifische Exception
+        except GithubException:
             raise ValueError(f"Branch existiert nicht: {branch}")
         except Exception as e:
             logger.error(f"Fehler beim Überprüfen des Branches: {e}")
@@ -210,16 +205,13 @@ class GitHubClient:
                 action = change.get("action")
                 file_path = change.get("file_path")
                 
-                # ✅ FIX: Validiere Action gegen Whitelist
                 if action not in self.config.ALLOWED_ACTIONS:
                     raise ValueError(f"Ungültige Aktion '{action}'. Erlaubt: {self.config.ALLOWED_ACTIONS}")
                 
-                # ✅ FIX: Zusätzliche Pfad-Sanitization
                 if not file_path or not file_path.strip():
                     logger.warning(f"Überspringe ungültigen Datei-Pfad: {file_path}")
                     continue
                 
-                # ✅ FIX: Normalisiere Pfad
                 file_path = file_path.strip("/")
                 
                 if file_path in processed_files:
@@ -232,26 +224,19 @@ class GitHubClient:
                     logger.info(f"🗑️ Lösche Datei: {file_path}")
                     continue
                 
-                # Für create und modify
                 new_content = change.get("new_content", "")
                 
-                # Validierung: Standard-Inhalt für leere neue Dateien
                 if not new_content and action == "create":
                     logger.warning(f"⚠️ Leerer Inhalt für neue Datei: {file_path}")
                     new_content = "# Leere Datei\n"
                 
-                # ✅ FIX: Verwende konfigurierbare Konstante
                 if len(new_content) > self.config.MAX_BLOB_SIZE:
-                    logger.warning(f"Große Datei erkannt: {file_path} ({len(new_content)} bytes)")
-                    
-                    # ✅ FIX: Spezifischer Fehler mit Vorschlag
                     raise ValueError(
                         f"Datei zu groß für direkten Commit: {file_path} "
                         f"({len(new_content)} bytes > {self.config.MAX_BLOB_SIZE} bytes). "
                         "Bitte Git LFS verwenden."
                     )
                 
-                # Erstelle Blob
                 blob = self.execute_with_rate_limit(
                     repo.create_git_blob,
                     new_content,
@@ -265,7 +250,6 @@ class GitHubClient:
                     "sha": blob.sha
                 })
                 
-                # ✅ FIX: Verwende get-Methode für sauberen Code
                 action_symbol = "✨ Erstelle" if action == "create" else "✏️ Ändere"
                 logger.info(f"{action_symbol}: {file_path}")
             
@@ -284,7 +268,7 @@ class GitHubClient:
             
             # 4. Erstelle Commit
             commit = self.execute_with_rate_limit(
-                repo.create_git_commit,  # ✅ FIX: Korrigierter Methodenname
+                repo.create_git_commit,
                 message=message,
                 tree=new_tree,
                 parents=[base_commit.commit]
@@ -301,11 +285,11 @@ class GitHubClient:
             
             return commit.sha
         
-        except ValueError:  # ✅ FIX: Validierte Fehler separat behandeln
+        except ValueError:
             logger.error("Validierungsfehler bei Commit-Erstellung", exc_info=True)
             raise
         
-        except GithubException as e:  # ✅ FIX: Spezifische GitHub-Fehler behandeln
+        except GithubException as e:
             logger.error(f"❌ GitHub API Fehler beim Commit: {e}", exc_info=True)
             error_msg = str(e).lower()
             if "rate limit" in error_msg:
@@ -318,3 +302,179 @@ class GitHubClient:
         except Exception as e:
             logger.error(f"❌ Unerwarteter Fehler beim Commit: {e}", exc_info=True)
             raise Exception(f"Commit-Erstellung fehlgeschlagen: {str(e)}")
+    
+    def create_atomic_commit_with_lock(
+        self,
+        repo: Repository,
+        changes: List[Dict[str, Any]],
+        branch: str,
+        message: str
+    ) -> str:
+        """Erstellt atomaren Commit mit Optimistic Locking zur Behandlung konkurrierender Änderungen"""
+        
+        if not changes:
+            raise ValueError("Keine Änderungen bereitgestellt")
+        
+        if len(message) > self.config.MAX_COMMIT_MSG_LENGTH:
+            raise ValueError(f"Commit-Nachricht zu lang (max. {self.config.MAX_COMMIT_MSG_LENGTH} Zeichen)")
+        
+        if not self.config.ALLOWED_BRANCH_PATTERN.match(branch):
+            raise ValueError(f"Ungültiger Branch-Name: {branch}")
+        
+        try:
+            repo.get_branch(branch)
+        except GithubException:
+            raise ValueError(f"Branch existiert nicht: {branch}")
+        except Exception as e:
+            logger.error(f"Fehler beim Überprüfen des Branches: {e}")
+            raise
+        
+        max_retries = 3
+        base_delay = 2  # Basis für exponentielles Backoff
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"🔒 Erstelle atomaren Commit mit Lock auf {repo.full_name}:{branch} (Versuch {attempt + 1}/{max_retries})")
+                
+                # 1. Hole aktuellen Commit SHA für Optimistic Locking
+                base_commit = self.execute_with_rate_limit(
+                    repo.get_commit, 
+                    f"heads/{branch}"
+                )
+                expected_sha = base_commit.sha
+                base_tree = base_commit.commit.tree
+                logger.debug(f"Erwartete Basis-SHA: {expected_sha[:7]}")
+                
+                # 2. Baue neuen Tree
+                input_tree = []
+                processed_files = set()
+                
+                for change in changes:
+                    action = change.get("action")
+                    file_path = change.get("file_path")
+                    
+                    if action not in self.config.ALLOWED_ACTIONS:
+                        raise ValueError(f"Ungültige Aktion '{action}'. Erlaubt: {self.config.ALLOWED_ACTIONS}")
+                    
+                    if not file_path or not file_path.strip():
+                        logger.warning(f"Überspringe ungültigen Datei-Pfad: {file_path}")
+                        continue
+                    
+                    file_path = file_path.strip("/")
+                    
+                    if file_path in processed_files:
+                        logger.warning(f"Überspringe duplikate Datei: {file_path}")
+                        continue
+                    
+                    processed_files.add(file_path)
+                    
+                    if action == "delete":
+                        logger.info(f"🗑️ Lösche Datei: {file_path}")
+                        continue
+                    
+                    new_content = change.get("new_content", "")
+                    
+                    if not new_content and action == "create":
+                        logger.warning(f"⚠️ Leerer Inhalt für neue Datei: {file_path}")
+                        new_content = "# Leere Datei\n"
+                    
+                    if len(new_content) > self.config.MAX_BLOB_SIZE:
+                        raise ValueError(
+                            f"Datei zu groß für direkten Commit: {file_path} "
+                            f"({len(new_content)} bytes > {self.config.MAX_BLOB_SIZE} bytes). "
+                            "Bitte Git LFS verwenden."
+                        )
+                    
+                    blob = self.execute_with_rate_limit(
+                        repo.create_git_blob,
+                        new_content,
+                        "utf-8"
+                    )
+                    
+                    input_tree.append({
+                        "path": file_path,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": blob.sha
+                    })
+                    
+                    action_symbol = "✨ Erstelle" if action == "create" else "✏️ Ändere"
+                    logger.info(f"{action_symbol}: {file_path}")
+                
+                # Prüfe auf tatsächliche Änderungen
+                if not input_tree and not any(c.get("action") == "delete" for c in changes):
+                    logger.warning("Keine Änderungen zum Committen")
+                    return expected_sha
+                
+                # 3. Erstelle neuen Tree
+                new_tree = self.execute_with_rate_limit(
+                    repo.create_git_tree,
+                    input_tree,
+                    base_tree
+                )
+                logger.info(f"🌳 Neuer Tree erstellt: {new_tree.sha[:7]}")
+                
+                # 4. Erstelle Commit
+                commit = self.execute_with_rate_limit(
+                    repo.create_git_commit,
+                    message=message,
+                    tree=new_tree,
+                    parents=[base_commit.commit]
+                )
+                logger.info(f"✅ Commit erstellt: {commit.sha[:7]}")
+                
+                # 5. Hole aktuelle Referenz und prüfe auf konkurrierende Änderungen
+                ref = self.execute_with_rate_limit(repo.get_git_ref, f"heads/{branch}")
+                
+                # Frühe Erkennung von konkurrierenden Modifikationen
+                if ref.object.sha != expected_sha:
+                    if attempt < max_retries - 1:
+                        delay = base_delay ** attempt
+                        logger.warning(
+                            f"⚠️ Konkurrierende Modifikation erkannt (erwartet: {expected_sha[:7]}, "
+                            f"aktuell: {ref.object.sha[:7]}). Warte {delay}s und versuche erneut..."
+                        )
+                        time.sleep(delay)
+                        continue
+                    else:
+                        raise Exception("Commit fehlgeschlagen: Zu viele konkurrierende Modifikationen")
+                
+                # 6. Update Branch Ref mit force=False (sichert CAS-Verhalten)
+                try:
+                    self.execute_with_rate_limit(ref.edit, commit.sha, force=False)
+                    logger.info(f"🚀 Branch {branch} aktualisiert auf {commit.sha[:7]}")
+                    return commit.sha
+                except GithubException as e:
+                    error_msg = str(e).lower()
+                    if "not a fast forward" in error_msg or "reference already exists" in error_msg:
+                        if attempt < max_retries - 1:
+                            delay = base_delay ** attempt
+                            logger.warning(
+                                f"⚠️ Fast-forward fehlgeschlagen (konkurrierende Änderung während Update). "
+                                f"Warte {delay}s und versuche erneut..."
+                            )
+                            time.sleep(delay)
+                            continue
+                        else:
+                            raise Exception("Commit fehlgeschlagen: Zu viele konkurrierende Modifikationen")
+                    raise
+                
+            except ValueError:
+                logger.error("Validierungsfehler bei Commit-Erstellung", exc_info=True)
+                raise
+            
+            except GithubException as e:
+                logger.error(f"❌ GitHub API Fehler beim Commit: {e}", exc_info=True)
+                error_msg = str(e).lower()
+                if "rate limit" in error_msg:
+                    raise Exception("GitHub Rate Limit überschritten. Bitte versuche es später erneut.")
+                elif "not found" in error_msg:
+                    raise Exception(f"Branch oder Repository nicht gefunden: {branch}")
+                else:
+                    raise Exception(f"Commit-Erstellung fehlgeschlagen: {str(e)}")
+            
+            except Exception as e:
+                logger.error(f"❌ Unerwarteter Fehler beim Commit: {e}", exc_info=True)
+                raise Exception(f"Commit-Erstellung fehlgeschlagen: {str(e)}")
+        
+        raise Exception("Unerwartet: Max retries ohne Ausnahme")

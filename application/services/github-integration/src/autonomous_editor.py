@@ -65,25 +65,27 @@ class AutonomousEditor:
         self.max_tokens = int(os.getenv("AUTONOMOUS_MAX_TOKENS", "4096"))
 
     def _validate_github_url(self, url: str) -> bool:
-        """Enhanced GitHub URL validation"""
-        # Basic pattern check
-        pattern = r"^https://github\.com/[a-zA-Z0-9][-a-zA-Z0-9]{0,38}/[a-zA-Z0-9._-]{1,100}/?$"
-        if not re.match(pattern, url):
-            raise ValueError(f"Invalid GitHub URL format: {url}")
+        """Enhanced GitHub URL validation with branch parameter support"""
         
-        # Additional checks
+        # Parse URL into components for proper validation
         parsed = urllib.parse.urlparse(url)
         
-        # Check scheme
+        # ✅ Check scheme (must be https)
         if parsed.scheme != 'https':
             raise ValueError("Only HTTPS URLs allowed")
         
-        # Check domain
+        # ✅ Check domain (must be github.com)
         if parsed.netloc != 'github.com':
             raise ValueError("Only github.com URLs allowed")
         
-        # Extract parts
-        parts = parsed.path.strip('/').split('/')
+        # ✅ Validate path (must be owner/repo format)
+        path = parsed.path.strip('/')
+        
+        # Check for path traversal attempts
+        if '..' in path or '//' in path:
+            raise ValueError("Path traversal detected")
+        
+        parts = path.split('/')
         if len(parts) != 2:
             raise ValueError("URL must be in format: github.com/owner/repo")
         
@@ -97,9 +99,66 @@ class AutonomousEditor:
         if not re.match(r'^[a-zA-Z0-9._-]{1,100}$', repo):
             raise ValueError(f"Invalid repo name: {repo}")
         
-        # Check for path traversal attempts
-        if '..' in url or parsed.path.count('//') > 0:
-            raise ValueError("Path traversal detected")
+        # ✅ NEW: Validate query parameters - only 'branch' is allowed
+        if parsed.query:
+            query_params = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+            
+            # Check for disallowed parameters
+            allowed_params = {'branch'}
+            actual_params = set(query_params.keys())
+            disallowed_params = actual_params - allowed_params
+            
+            if disallowed_params:
+                raise ValueError(f"Only 'branch' query parameter is allowed, got: {', '.join(disallowed_params)}")
+            
+            # ✅ NEW: Validate branch name if present
+            if 'branch' in query_params:
+                branch_name = query_params['branch'][0]
+                
+                # Branch name cannot be empty
+                if not branch_name:
+                    raise ValueError("Branch parameter cannot be empty")
+                
+                # Comprehensive Git branch name validation
+                self._validate_git_branch_name(branch_name)
+        
+        # ✅ NEW: No fragments allowed
+        if parsed.fragment:
+            raise ValueError("URL fragments are not allowed")
+        
+        return True
+
+    def _validate_git_branch_name(self, branch_name: str) -> bool:
+        """Validate Git branch name according to Git rules"""
+        
+        # Cannot contain ASCII control characters (0-31) or DEL (127)
+        if any(ord(c) < 32 or ord(c) == 127 for c in branch_name):
+            raise ValueError(f"Branch name cannot contain control characters: {branch_name}")
+        
+        # Cannot contain spaces or specific invalid characters
+        invalid_chars = ' \t\n\r\0\f\v~^:?*[\\'
+        if any(c in branch_name for c in invalid_chars):
+            raise ValueError(f"Branch name contains invalid characters: {branch_name}")
+        
+        # Cannot start with '-' or '.'
+        if branch_name.startswith('-') or branch_name.startswith('.'):
+            raise ValueError(f"Branch name cannot start with '{branch_name[0]}': {branch_name}")
+        
+        # Cannot end with '/'
+        if branch_name.endswith('/'):
+            raise ValueError(f"Branch name cannot end with '/': {branch_name}")
+        
+        # Cannot end with '.lock'
+        if branch_name.endswith('.lock'):
+            raise ValueError(f"Branch name cannot end with '.lock': {branch_name}")
+        
+        # Cannot be '@' alone
+        if branch_name == '@':
+            raise ValueError("Branch name cannot be '@'")
+        
+        # Cannot contain '..' or '//'
+        if '..' in branch_name or '//' in branch_name:
+            raise ValueError(f"Branch name cannot contain '..' or '//': {branch_name}")
         
         return True
 

@@ -339,6 +339,30 @@ async def generate(request: GenerateRequest):
     if model is None or tokenizer is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
+    # ✅ NEU: Comprehensive Validation
+    if request.prompt and request.messages:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot specify both 'prompt' and 'messages'"
+        )
+    
+    if not request.prompt and not request.messages:
+        raise HTTPException(
+            status_code=400,
+            detail="Must specify either 'prompt' or 'messages'"
+        )
+    
+    # ✅ NEU: Token Budget Check
+    estimated_tokens = len(request.prompt or '') // 4  # Rough estimate
+    if request.messages:
+        estimated_tokens = sum(len(m.content) for m in request.messages) // 4
+    
+    if estimated_tokens + request.max_tokens > 32000:  # Model context limit
+        raise HTTPException(
+            status_code=400,
+            detail=f"Request too large: {estimated_tokens} input + {request.max_tokens} output > 32K limit"
+        )
+    
     # ✅ NEU - Input validation
     if request.prompt:
         if len(request.prompt) > 50000:  # ~50K chars = ~12K tokens
@@ -452,19 +476,27 @@ async def generate_internal(
             
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                logger.error("CUDA OOM erkannt, versuche Wiederherstellung...")
+                logger.error("CUDA OOM - Full cleanup...")
+                
+                # ✅ Aggressives Cleanup
                 torch.cuda.empty_cache()
-                gc.collect()  # Force garbage collection
+                torch.cuda.synchronize()
+                gc.collect()
                 
-                if _retry_count == 0 and request.max_tokens > 512:
-                    logger.warning("OOM: Retrying with reduced tokens")
-                    request.max_tokens = 512
+                # ✅ Clear KV-Cache wenn vorhanden
+                if hasattr(model, 'past_key_values'):
+                    model.past_key_values = None
+                
+                # ✅ Force garbage collection
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                if _retry_count == 0:
+                    # Retry mit stark reduzierten Parametern
+                    request.max_tokens = min(request.max_tokens // 2, 256)
+                    request.temperature = 0.1  # Deterministic
                     return await generate_internal(request, _retry_count=1)
-                
-                raise HTTPException(
-                    status_code=503,
-                    detail="GPU Speicher voll. Bitte Eingabe verkleinern oder später erneut versuchen."
-                )
             else:
                 raise
         except Exception as e:

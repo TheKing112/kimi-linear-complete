@@ -9,6 +9,10 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from time import time
 
+# ✅ NEU - Für Prompt Sanitization
+import re
+import html
+
 import discord
 from discord.ext import commands
 import aiohttp
@@ -23,6 +27,29 @@ from remote_control import setup_remote_control
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("kimi-bot-master")
+
+# ✅ NEU: Prompt Sanitization Funktion
+def sanitize_prompt(prompt: str) -> str:
+    """Sanitize user input by removing control characters and dangerous patterns"""
+    # Remove control characters (keep newlines)
+    prompt = ''.join(char for char in prompt if ord(char) >= 32 or char == '\n')
+    
+    # Limit consecutive whitespace
+    prompt = re.sub(r'\s+', ' ', prompt)
+    
+    # Remove potential injection patterns
+    dangerous_patterns = [
+        r'<script',
+        r'javascript:',
+        r'on\w+\s*=',  # event handlers
+        r'eval\(',
+        r'exec\(',
+    ]
+    
+    for pattern in dangerous_patterns:
+        prompt = re.sub(pattern, '', prompt, flags=re.IGNORECASE)
+    
+    return prompt.strip()
 
 # ✅ NEU: GPU-Speicher-Check Funktion
 def check_gpu_memory_available(required_gb: float = 1.5) -> bool:
@@ -183,6 +210,16 @@ class KimiBot(commands.Bot):
         logger.info("🤖 Discord Bot mit Remote Control initialisiert")
         logger.info("🌐 Health Check Server gestartet auf Port 8005")
         
+    async def _get_or_create_session(self) -> aiohttp.ClientSession:
+        """Lazily create or get aiohttp session"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=300),
+                headers={"User-Agent": "Kimi-Bot/2.1"}
+            )
+            logger.info("Created new aiohttp session for request")
+        return self.session
+        
     async def close(self):
         """Aufräumen beim Herunterfahren mit vollständiger Ressourcen-Freigabe und Timeouts"""
         
@@ -208,7 +245,7 @@ class KimiBot(commands.Bot):
         # ✅ Discord.py Cleanup
         await super().close()
 
-# ✅ NEU - Mit Lock für Thread-Safety
+# ✅ NEU: Mit Lock für Thread-Safety
 class RateLimiter:
     def __init__(self, max_requests: int = 10, window: int = 60):
         self.max_requests = max_requests
@@ -231,10 +268,7 @@ class RateLimiter:
     def reset(self, user_id: str):
         self.requests.pop(user_id, None)
 
-# ✅ Instanz erstellen
-rate_limiter = RateLimiter(max_requests=10, window=60)
-
-# ✅ NEU - Spezifische Error Codes
+# ✅ NEU: Spezifische Error Codes
 class BotError(Exception):
     def __init__(self, code: str, message: str):
         self.code = code
@@ -292,6 +326,14 @@ async def on_command_error(ctx: commands.Context, error):
 @bot.command(name='code')
 async def generate_code(ctx: commands.Context, *, prompt: str):
     """Generiere Code mit Kimi Linear 48B"""
+    # ✅ SANITIZE PROMPT
+    prompt = sanitize_prompt(prompt)
+    
+    # ✅ Check length after sanitization
+    if len(prompt) < 3:
+        await ctx.send("⚠️ Prompt zu kurz nach Sanitization")
+        return
+    
     # ✅ Rate Limit Check
     if not await rate_limiter.is_allowed(str(ctx.author.id)):
         await ctx.send("⏱️ Rate limit erreicht. Bitte warte 60 Sekunden.")
@@ -345,6 +387,7 @@ def build_enhanced_prompt(prompt: str, memories: list) -> str:
         context += "\n"
     return f"{context}Generate high-quality Python code for: {prompt}\n\nRequirements:\n- Include proper error handling and type hints\n- Add comprehensive docstrings\n- Follow PEP 8 style guidelines\n- Make it production-ready\n- Include example usage if appropriate\n\nCode:\n```python\n"
 
+# ✅ FIX: generate_with_kimi mit korrekter Session-Verwaltung
 async def generate_with_kimi(
     prompt: str,
     max_retries: int = 3,
@@ -357,43 +400,59 @@ async def generate_with_kimi(
         logger.error("GPU-Speicher unzureichend für Kimi-Generierung")
         raise BotError("GPU_MEMORY", "Unzureichender GPU-Speicher (benötigt: 1.5GB)")
     
-    for attempt in range(max_retries):
-        try:
-            payload = {"prompt": prompt, "max_tokens": 2048, "temperature": 0.2, "top_p": 0.95}
-            async with bot.session.post(f"{bot.kimi_url}/generate", json=payload, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                elif resp.status == 503:
-                    if attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)
-                        logger.warning(f"Kimi unavailable, retry in {delay}s...")
-                        await asyncio.sleep(delay)
-                        continue
-                    logger.error("Model not loaded after all retries")
-                    return None
-                else:
-                    logger.error(f"Kimi API error: {resp.status}")
-                    return None
-        except asyncio.TimeoutError:
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"Timeout, retry in {delay}s...")
-                await asyncio.sleep(delay)
-                continue
-            logger.error("Timeout after all retries")
-            return None
-        except aiohttp.ClientError as e:
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"Network error: {e}, retry in {delay}s...")
-                await asyncio.sleep(delay)
-                continue
-            logger.error(f"Network error: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            return None
-    return None
+    session = None
+    try:
+        session = await bot._get_or_create_session()
+        
+        for attempt in range(max_retries):
+            try:
+                payload = {"prompt": prompt, "max_tokens": 2048, "temperature": 0.2, "top_p": 0.95}
+                async with session.post(
+                    f"{bot.kimi_url}/generate", 
+                    json=payload, 
+                    timeout=aiohttp.ClientTimeout(total=300)
+                ) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 503:
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (2 ** attempt)
+                            logger.warning(f"Kimi unavailable, retry in {delay}s...")
+                            await asyncio.sleep(delay)
+                            continue
+                        logger.error("Model not loaded after all retries")
+                        return None
+                    else:
+                        logger.error(f"Kimi API error: {resp.status}")
+                        return None
+            except asyncio.TimeoutError:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Timeout, retry in {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error("Timeout after all retries")
+                return None
+            except aiohttp.ClientError as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Network error: {e}, retry in {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(f"Network error: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Generation failed: {e}")
+        return None
+    finally:
+        # ✅ Cleanup garantiert
+        if session and hasattr(session, '_connector'):
+            await asyncio.sleep(0.250)  # Connection pool cleanup
+            # Don't close session as it's managed by bot
 
 async def store_memory(user_id: str, content: str, prompt: str, tokens: int, guild_id: Optional[str]):
     """Speichere generierten Code in Cognee"""

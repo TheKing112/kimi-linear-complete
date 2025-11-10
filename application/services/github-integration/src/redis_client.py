@@ -42,10 +42,10 @@ class RedisClient:
             if self.__class__._initialized:
                 return
             
+            client = None
             try:
                 # Initialize Redis client
-                # Note: redis.from_url is synchronous and returns a client instance
-                self.client = redis.from_url(
+                client = redis.from_url(
                     os.getenv("REDIS_URL", "redis://localhost:6379"),
                     encoding="utf-8",
                     decode_responses=True,
@@ -56,12 +56,37 @@ class RedisClient:
                     retry_on_timeout=True,
                     health_check_interval=30
                 )
+                
+                # Test connection before marking as initialized
+                await client.ping()
+                
+                self.client = client
                 self.max_retries = 3
                 self.__class__._initialized = True
                 logger.info("Redis client initialized successfully.")
+                
             except Exception as e:
+                # Cleanup on failure
+                if client:
+                    await client.close()
                 logger.error(f"Failed to initialize Redis client: {e}")
                 raise
+    
+    async def close(self) -> None:
+        """Explicit cleanup method for Redis client."""
+        if hasattr(self, 'client') and self.client:
+            try:
+                await self.client.close()
+                await self.client.connection_pool.disconnect()
+                self.__class__._initialized = False
+                logger.info("Redis client closed successfully.")
+            except Exception as e:
+                logger.warning(f"Error closing Redis client: {e}")
+    
+    def _ensure_initialized(self) -> None:
+        """Ensure client is initialized before use."""
+        if not hasattr(self, 'client') or not self.__class__._initialized:
+            raise RuntimeError("Redis client not initialized. Call initialize() first.")
     
     async def acquire_lock(
         self,
@@ -70,6 +95,7 @@ class RedisClient:
         retry_delay: float = 0.1
     ) -> bool:
         """Acquire distributed lock with retry."""
+        self._ensure_initialized()
         lock_key = f"lock:{lock_name}"
         
         for attempt in range(self.max_retries):
@@ -102,6 +128,7 @@ class RedisClient:
         acquire_timeout: int = 30
     ) -> bool:
         """Acquire lock with acquisition timeout."""
+        self._ensure_initialized()
         lock_key = f"lock:{lock_name}"
         start_time = time.time()
         
@@ -120,18 +147,21 @@ class RedisClient:
         
         return False
     
-    async def release_lock(self, lock_name: str):
+    async def release_lock(self, lock_name: str) -> None:
         """Release lock."""
+        self._ensure_initialized()
         await self.client.delete(f"lock:{lock_name}")
     
     async def is_duplicate_request(self, user_id: str, repo_url: str, prompt: str) -> bool:
         """Check if same request was processed recently."""
+        self._ensure_initialized()
         request_hash = hashlib.sha256(f"{user_id}:{repo_url}:{prompt}".encode()).hexdigest()
         exists = await self.client.exists(f"autonomous:request:{request_hash}")
         return exists
     
     async def health_check(self) -> bool:
         """Check Redis connection health."""
+        self._ensure_initialized()
         try:
             await self.client.ping()
             return True
@@ -139,12 +169,28 @@ class RedisClient:
             logger.error(f"Redis health check failed: {e}")
             return False
     
-    async def ensure_connection(self):
-        """Ensure Redis is connected."""
-        if not await self.health_check():
-            logger.info("Redis connection lost. Reconnecting...")
-            # redis.from_url is synchronous
-            self.client = redis.from_url(
+    async def ensure_connection(self) -> None:
+        """Ensure Redis is connected, reconnect if necessary."""
+        self._ensure_initialized()
+        
+        # Try health check first
+        if await self.health_check():
+            return
+        
+        logger.info("Redis connection lost. Reconnecting...")
+        
+        # Close old connection if exists
+        if hasattr(self, 'client'):
+            try:
+                await self.client.close()
+                await self.client.connection_pool.disconnect()
+            except Exception as e:
+                logger.warning(f"Error closing old Redis client: {e}")
+        
+        # Create new client
+        client = None
+        try:
+            client = redis.from_url(
                 os.getenv("REDIS_URL", "redis://localhost:6379"),
                 encoding="utf-8",
                 decode_responses=True,
@@ -155,7 +201,22 @@ class RedisClient:
                 retry_on_timeout=True,
                 health_check_interval=30
             )
-            logger.info("Redis reconnected")
+            
+            # Test new connection
+            await client.ping()
+            
+            self.client = client
+            logger.info("Redis reconnected successfully.")
+            
+        except Exception as e:
+            # Cleanup on failure
+            if client:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+            logger.error(f"Failed to reconnect Redis: {e}")
+            raise
     
     async def mark_request_processed(
         self,
@@ -163,8 +224,9 @@ class RedisClient:
         repo_url: str,
         prompt: str,
         ttl: int = 3600
-    ):
+    ) -> None:
         """Mark request as processed with validation."""
+        self._ensure_initialized()
         if ttl < 60:
             raise ValueError("TTL must be at least 60 seconds")
         if ttl > 86400:

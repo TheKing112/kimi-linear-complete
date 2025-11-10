@@ -11,6 +11,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- Aktiviere weitere nützliche Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "btree_gin";
+CREATE EXTENSION IF NOT EXISTS pg_cron;  -- Für automatische Index-Pflege
 
 -- =============================================================================
 -- TABLE: memories
@@ -112,6 +113,26 @@ WHERE is_autonomous = true;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_user_autonomous
 ON memories(user_id, is_autonomous, created_at DESC)
 WHERE is_autonomous = true;
+
+-- ✅ HINZUFÜGEN nach allen CREATE INDEX:
+-- Automatische Index-Pflege
+CREATE OR REPLACE FUNCTION maintain_indexes()
+RETURNS void AS $$
+BEGIN
+    -- Reindex bei Fragmentierung > 30%
+    PERFORM schemaname, tablename, indexname
+    FROM pg_stat_user_indexes
+    WHERE idx_scan = 0 
+    AND indexrelname NOT LIKE 'pg_%';
+    
+    -- Analyze nach großen Changes
+    ANALYZE memories;
+    ANALYZE knowledge_graph;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Cronjob (via pg_cron extension)
+SELECT cron.schedule('index-maintenance', '0 3 * * 0', 'SELECT maintain_indexes()');
 
 -- =============================================================================
 -- FUNCTION: Update Trigger für updated_at

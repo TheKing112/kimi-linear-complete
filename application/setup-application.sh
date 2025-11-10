@@ -35,32 +35,47 @@ create_directories() {
 }
 
 create_env_file() {
+    # ✅ Check write permissions
+    if [ ! -w . ]; then
+        error "No write permission in current directory"
+    fi
+    
+    # ✅ Check disk space
+    local available_kb=$(df -k . | tail -1 | awk '{print $4}')
+    if [ "$available_kb" -lt 1024 ]; then
+        error "Insufficient disk space (< 1MB available)"
+    fi
+    
+    # Use temp file for atomic operations
+    local temp_env=$(mktemp) || error "Cannot create temp file"
+    
+    # Trigger error on failure inside the function
+    trap 'rm -f "$temp_env"; error "Failed to create .env file"' ERR
+    
     if [[ -f .env ]]; then
         log "Backing up existing .env..."
         backup_name=".env.backup.$(date +%s)"
-        cp .env "$backup_name"
+        cp .env "$backup_name" || error "Failed to create backup"
         ok "Backup created: $backup_name"
         
-        # ✅ NEU - Frage ob überschreiben
+        # Ask if user wants to overwrite
         read -p "Overwrite existing .env? [y/N] " -r
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
             log "Keeping existing .env"
+            rm -f "$temp_env"
+            trap - ERR
             return 0
         fi
     fi
     
     log "Creating comprehensive .env file..."
     
-    # Discord Control Variables
-    DISCORD_CONTROL_USERS=""  # Komma-separierte User IDs
-    DISCORD_CONTROL_CHANNEL=""  # Kanal ID
-    DISCORD_OWNER_ID=""  # Eigene Discord User ID
-    
     # Generate secure passwords
     POSTGRES_PASSWORD=$(openssl rand -base64 32)
     GRAFANA_PASSWORD=$(openssl rand -base64 16)
+    GITHUB_WEBHOOK_SECRET=$(openssl rand -hex 32)
     
-    cat > .env << EOF
+    cat > "$temp_env" << EOF
 # =============================================================================
 # KIMI LINEAR 48B - PRODUCTION ENVIRONMENT
 # =============================================================================
@@ -102,7 +117,7 @@ GITHUB_INTEGRATION_URL=http://github-integration:8004
 
 # GitHub Integration (REQUIRED for autonomous editing)
 GITHUB_TOKEN=your_github_token_here
-GITHUB_WEBHOOK_SECRET=$(openssl rand -hex 32)
+GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
 GITHUB_AUTO_REVIEW=true
 GITHUB_AUTO_CREATE_PR=false
 
@@ -130,14 +145,21 @@ NETWORK_NAME=kimi-network
 
 # Logging
 LOG_LEVEL=INFO
+
+# Discord Control Variables
+DISCORD_CONTROL_USERS=
+DISCORD_CONTROL_CHANNEL=
+DISCORD_OWNER_ID=
 EOF
     
-    # Add Discord control variables
-    echo "DISCORD_CONTROL_USERS=${DISCORD_CONTROL_USERS}" >> .env
-    echo "DISCORD_CONTROL_CHANNEL=${DISCORD_CONTROL_CHANNEL}" >> .env
-    echo "DISCORD_OWNER_ID=${DISCORD_OWNER_ID}" >> .env
+    # Atomic move from temp file to final location
+    mv "$temp_env" .env || error "Failed to create .env"
     
-    chmod 600 .env
+    # Set secure permissions
+    chmod 600 .env || error "Failed to set .env permissions"
+    
+    # Clear trap
+    trap - ERR
     
     ok "Created .env with all variables (PLEASE EDIT TOKENS!)"
 }
@@ -583,12 +605,12 @@ EOF
 preflight_checks() {
     log "Running preflight checks..."
     
-    # ✅ NEU - Check write permissions
+    # ✅ Check write permissions
     if [ ! -w . ]; then
         error "No write permission in current directory"
     fi
     
-    # ✅ NEU - Check if running as root (not recommended)
+    # ✅ Check if running as root
     if [ "$EUID" -eq 0 ]; then
         warn "Running as root is not recommended"
         warn "Consider using a non-root user"
@@ -627,7 +649,6 @@ preflight_checks() {
     ok "Preflight checks complete"
 }
 
-# ✅ NEU - Nach preflight_checks() Definition
 check_dependencies() {
     log "Checking dependencies..."
     
@@ -656,50 +677,6 @@ check_dependencies() {
     ok "All dependencies present"
 }
 
-# ==================================== MAIN ====================================
-
-main() {
-    cat << "EOF"
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                              ║
-║   KIMI LINEAR 48B - APPLICATION SETUP                                       ║
-║   Sparse Activation: 48B Total, 3B Active per Forward Pass                   ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-EOF
-    
-    check_dependencies  # ✅ NEU: Run dependency checks first
-    preflight_checks  # NEW: Run checks first
-    
-    create_directories
-    create_env_file
-    validate_env_file || true  # NEW: Validate .env (non-fatal)
-    create_init_scripts
-    create_docker_compose
-    create_helper_scripts
-    
-    validate_setup  # ✅ NEU: Validate the complete setup
-    
-    log ""
-    ok "╔══════════════════════════════════════════════════════════════════════════════╗"
-    ok "║  SETUP COMPLETE! 🎉                                                          ║"
-    ok "║                                                                              ║"
-    ok "║  NEXT STEPS:                                                                 ║"
-    ok "║  1. Edit .env and add your tokens (CRITICAL!)                               ║"
-    ok "║  2. Run: ./start.sh                                                         ║"
-    ok "║  3. Wait 5-10 min for model loading                                         ║"
-    ok "║  4. Check logs: ./logs.sh kimi-linear                                       ║"
-    ok "║                                                                              ║"
-    ok "║  ACCESS POINTS:                                                              ║"
-    ok "║  • Grafana:        http://localhost:3000                                    ║"
-    ok "║  • Prometheus:     http://localhost:9090                                    ║"
-    ok "║  • Kimi API Docs:  http://localhost:8003/docs                               ║"
-    ok "║  • Cognee API:     http://localhost:8001/docs                               ║"
-    ok "║  • GitHub API:     http://localhost:8004/docs                               ║"
-    ok "╚══════════════════════════════════════════════════════════════════════════════╝"
-}
-
-# ✅ NEU - Neue Funktion nach main()
 validate_setup() {
     log "Validating setup..."
     
@@ -733,6 +710,49 @@ validate_setup() {
     fi
     
     ok "Setup validation passed"
+}
+
+# ==================================== MAIN ====================================
+
+main() {
+    cat << "EOF"
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║   KIMI LINEAR 48B - APPLICATION SETUP                                       ║
+║   Sparse Activation: 48B Total, 3B Active per Forward Pass                   ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+EOF
+    
+    check_dependencies
+    preflight_checks
+    
+    create_directories
+    create_env_file
+    validate_env_file || true  # Non-fatal validation
+    create_init_scripts
+    create_docker_compose
+    create_helper_scripts
+    
+    validate_setup
+    
+    log ""
+    ok "╔══════════════════════════════════════════════════════════════════════════════╗"
+    ok "║  SETUP COMPLETE! 🎉                                                          ║"
+    ok "║                                                                              ║"
+    ok "║  NEXT STEPS:                                                                 ║"
+    ok "║  1. Edit .env and add your tokens (CRITICAL!)                               ║"
+    ok "║  2. Run: ./start.sh                                                         ║"
+    ok "║  3. Wait 5-10 min for model loading                                         ║"
+    ok "║  4. Check logs: ./logs.sh kimi-linear                                       ║"
+    ok "║                                                                              ║"
+    ok "║  ACCESS POINTS:                                                              ║"
+    ok "║  • Grafana:        http://localhost:3000                                    ║"
+    ok "║  • Prometheus:     http://localhost:9090                                    ║"
+    ok "║  • Kimi API Docs:  http://localhost:8003/docs                               ║"
+    ok "║  • Cognee API:     http://localhost:8001/docs                               ║"
+    ok "║  • GitHub API:     http://localhost:8004/docs                               ║"
+    ok "╚══════════════════════════════════════════════════════════════════════════════╝"
 }
 
 main "$@" 2>&1 | tee "$LOG_FILE"

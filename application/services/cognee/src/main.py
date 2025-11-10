@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import re
+import asyncio  # ✅ NEU - Für RateLimiter
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
 from functools import wraps
@@ -76,18 +77,15 @@ class UserMemoriesResponse(BaseModel):
 embeddings_model: Optional[SentenceTransformer] = None
 db_pool: Optional[asyncpg.Pool] = None
 
-# Rate limiting storage
-user_request_times = defaultdict(list)
-
 # Konstanten
 EMBEDDING_DIM = 384  # Für all-MiniLM-L6-v2
 KNOWLEDGE_CONFIDENCE_THRESHOLD = 0.7
 
-# ✅ KORRIGIERT: Prepared Statement Sicherheit mit Column Mapping
-COLUMN_MAP = {
-    'created_at': 'created_at',
-    'updated_at': 'updated_at', 
-    'id': 'id'
+# ✅ KORRIGIERT: Prepared Statement Sicherheit mit Query Mapping
+ALLOWED_ORDERS = {
+    'created_at': 'created_at DESC',
+    'updated_at': 'updated_at DESC',
+    'id': 'id DESC'
 }
 
 # Hilfsfunktionen
@@ -109,6 +107,29 @@ def generate_embedding(text: str) -> List[float]:
     embedding = embeddings_model.encode(text, convert_to_tensor=False)
     return embedding.tolist()
 
+# ✅ NEU - Thread-sichere RateLimiter Klasse
+class RateLimiter:
+    def __init__(self):
+        self.requests = defaultdict(list)
+        self._locks = defaultdict(asyncio.Lock)
+    
+    async def is_allowed(self, key: str, endpoint: str, max_requests: int, window: int) -> bool:
+        rate_key = f"{endpoint}:{key}"
+        
+        async with self._locks[rate_key]:
+            now = time()
+            user_times = self.requests[rate_key]
+            user_times[:] = [t for t in user_times if now - t < window]
+            
+            if len(user_times) >= max_requests:
+                return False
+            
+            user_times.append(now)
+            return True
+
+# Global rate limiter instance
+rate_limiter = RateLimiter()
+
 def rate_limit(max_requests: int = 10, window: int = 60):
     """Rate limiting decorator pro User"""
     def decorator(func):
@@ -117,17 +138,12 @@ def rate_limit(max_requests: int = 10, window: int = 60):
             request = kwargs.get('request') or args[0]
             user_id = request.user_id
             
-            now = time()
-            user_times = user_request_times[user_id]
-            user_times[:] = [t for t in user_times if now - t < window]
-            
-            if len(user_times) >= max_requests:
+            if not await rate_limiter.is_allowed(user_id, func.__name__, max_requests, window):
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limit: {max_requests} requests per {window}s"
                 )
             
-            user_times.append(now)
             return await func(*args, **kwargs)
         return wrapper
     return decorator
@@ -349,14 +365,14 @@ async def get_user_memories(
 ):
     """Hole Memories mit Pagination"""
     try:
-        # ✅ KORRIGIERT: Prepared Statement Sicherheit mit Column Mapping
-        order_col = COLUMN_MAP.get(order_by.strip().lower())
-        if not order_col:
+        # ✅ KORRIGIERT: Prepared Statement Sicherheit mit Query Mapping
+        order_clause = ALLOWED_ORDERS.get(order_by.strip().lower())
+        if not order_clause:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Invalid order_by column. Allowed: {', '.join(sorted(COLUMN_MAP.keys()))}"
+                detail=f"Invalid order_by column. Allowed: {', '.join(sorted(ALLOWED_ORDERS.keys()))}"
             )
-        
+
         async with db_pool.acquire() as conn:
             # Count total
             total = await conn.fetchval(
@@ -364,14 +380,40 @@ async def get_user_memories(
                 user_id
             )
             
-            # ✅ SICHER: Direkte Verwendung nach Validierung durch Mapping
-            rows = await conn.fetch(f"""
-                SELECT id, content, metadata, created_at
-                FROM memories
-                WHERE user_id = $1
-                ORDER BY {order_col} DESC
-                LIMIT $2 OFFSET $3
-            """, user_id, limit, offset)
+            # ✅ SICHER: Separate Prepared Statements für jede Sortierung
+            if order_clause == 'created_at DESC':
+                rows = await conn.fetch("""
+                    SELECT id, content, metadata, created_at
+                    FROM memories
+                    WHERE user_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                """, user_id, limit, offset)
+            elif order_clause == 'updated_at DESC':
+                rows = await conn.fetch("""
+                    SELECT id, content, metadata, created_at
+                    FROM memories
+                    WHERE user_id = $1
+                    ORDER BY updated_at DESC
+                    LIMIT $2 OFFSET $3
+                """, user_id, limit, offset)
+            elif order_clause == 'id DESC':
+                rows = await conn.fetch("""
+                    SELECT id, content, metadata, created_at
+                    FROM memories
+                    WHERE user_id = $1
+                    ORDER BY id DESC
+                    LIMIT $2 OFFSET $3
+                """, user_id, limit, offset)
+            else:
+                # Fallback, sollte nicht passieren
+                rows = await conn.fetch("""
+                    SELECT id, content, metadata, created_at
+                    FROM memories
+                    WHERE user_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                """, user_id, limit, offset)
         
         memories = []
         for row in rows:
