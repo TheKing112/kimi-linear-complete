@@ -5,11 +5,18 @@ global:
 
 scrape_configs:
   - job_name: 'kimi-linear'
-    scrape_interval: 60s  # Reduced frequency to minimize GPU load
-    scrape_timeout: 30s
+    scrape_interval: 120s  # ✅ 2 minutes - reduced frequency to minimize GPU load
+    scrape_timeout: 45s
     static_configs:
       - targets: ['kimi-linear:8003']
     metrics_path: /metrics
+    # Conditional scraping: only targets where model is loaded
+    # Note: __meta_model_loaded requires custom service discovery
+    # Alternative: Have /metrics return HTTP 503 when model is not loaded
+    relabel_configs:
+      - source_labels: [__meta_model_loaded]
+        regex: true
+        action: keep
   
   - job_name: 'cognee'
     scrape_interval: 30s

@@ -1,3 +1,4 @@
+```bash
 #!/bin/bash
 # =============================================================================
 # KIMI LINEAR 48B - ONE-COMMAND VM SETUP
@@ -5,6 +6,18 @@
 # =============================================================================
 
 set -euo pipefail
+
+# ===== COLORS & LOGGING (Zuerst definieren!) =====
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly BLUE='\033[0;34m'
+readonly YELLOW='\033[1;33m'
+readonly NC='\033[0m'
+
+log() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} ▶ $*"; }
+ok() { echo -e "${GREEN}✓${NC} $*"; }
+error() { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
+warn() { echo -e "${YELLOW}⚠${NC} $*"; }
 
 # ===== TRAP & CLEANUP =====
 trap cleanup_on_interrupt INT TERM
@@ -32,9 +45,13 @@ readonly GPU_TYPE="nvidia-l4"
 readonly DISK_SIZE="400GB"
 readonly ZONES=("us-east1-b" "us-east1-c" "us-central1-a" "us-central1-b" "us-west1-b")
 
-# Repository URL - kann als Argument oder über KIMI_REPO_URL Umgebungsvariable gesetzt werden
-# Standard: https://github.com/your-org/kimi-linear-complete.git
-REPO_URL="${1:-${KIMI_REPO_URL:-https://github.com/your-org/kimi-linear-complete.git}}"
+# ===== VALIDATION =====
+# Repository URL - kann als Parameter oder Umgebungsvariable gesetzt werden
+REPO_URL="${1:-${KIMI_REPO_URL:-}}"
+
+if [[ -z "$REPO_URL" ]]; then
+    error "Repository URL erforderlich!\nUsage: $0 <github-repo-url>\n   or: export KIMI_REPO_URL=<url>"
+fi
 
 # Validiere GitHub URL
 if [[ ! "$REPO_URL" =~ ^https://github.com/ ]]; then
@@ -46,20 +63,7 @@ fi
 SETUP_SCRIPT_URL="${REPO_URL/github.com/raw.githubusercontent.com}"
 SETUP_SCRIPT_URL="${SETUP_SCRIPT_URL%.git}/main/setup-in-vm.sh"
 
-# ===== COLORS =====
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly BLUE='\033[0;34m'
-readonly YELLOW='\033[1;33m'
-readonly NC='\033[0m'
-
-# ===== LOGGING =====
-log() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} ▶ $*"; }
-ok() { echo -e "${GREEN}✓${NC} $*"; }
-error() { echo -e "${RED}✗${NC} $*" >&2; exit 1; }
-warn() { echo -e "${YELLOW}⚠${NC} $*"; }
-
-# ===== VALIDATION =====
+# ===== VALIDATION FUNCTIONS =====
 check_gcloud() {
     if ! command -v gcloud &>/dev/null; then
         error "gcloud CLI nicht installiert. Bitte installieren: https://cloud.google.com/sdk/docs/install"
@@ -353,3 +357,4 @@ EOF
 
 # ===== SCRIPT START =====
 main "$@"
+```

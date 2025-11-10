@@ -221,6 +221,7 @@ class AutonomousEditor:
         self._validate_github_url(repo_url)
         
         timeout = timeout or float(os.getenv("AUTONOMOUS_TIMEOUT", "600"))
+        start_time = time.monotonic()  # ⏱️ Latency-Tracking Start
         
         try:
             return await asyncio.wait_for(
@@ -228,7 +229,11 @@ class AutonomousEditor:
                 timeout=timeout
             )
         except asyncio.TimeoutError:
-            raise TimeoutError(f"Operation timed out after {timeout}s")
+            return self._enhance_error(
+                TimeoutError(f"Operation timed out after {timeout}s"),
+                start_time,
+                {"timeout": True}
+            )
 
     async def _process_internal(
         self,
@@ -323,19 +328,20 @@ class AutonomousEditor:
                 
         except Exception as e:
             # Fehler mit Latency-Tracking zurückgeben
-            raise self._enhance_error(e, start_time, operation_metrics)
+            return self._enhance_error(e, start_time, operation_metrics)  # 'return' statt 'raise'
 
     def _get_latency_ms(self, start_time: float) -> float:
         """⏱️ Latency in Millisekunden berechnen"""
         return round((time.monotonic() - start_time) * 1000, 2)
     
-    def _enhance_error(self, error: Exception, start_time: float, metrics: Dict) -> Exception:
-        """✅ Sichere Attribute-Zuweisung"""
-        if not hasattr(error, 'latency_ms'):
-            error.latency_ms = self._get_latency_ms(start_time)
-        if not hasattr(error, 'operation_metrics'):
-            error.operation_metrics = metrics
-        return error
+    def _enhance_error(self, error: Exception, start_time: float, metrics: Dict) -> Dict:
+        """Return enhanced error info instead of mutating exception"""
+        return {
+            'error': str(error),
+            'type': type(error).__name__,
+            'latency_ms': self._get_latency_ms(start_time),
+            'operation_metrics': metrics
+        }
 
     async def analyze_prompt_and_repo(self, prompt: str, repo_url: str, user_id: str) -> Dict[str, Any]:
         """Analysiere was der User will und was im Repo existiert"""
@@ -544,3 +550,9 @@ class AutonomousEditor:
         """Cleanup resources"""
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.cleanup()

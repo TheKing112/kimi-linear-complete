@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # Konstanten
 COMPOSE_PATH = "/home/ubuntu/kimi-linear-complete/application"
 ALLOWED_DOCKER_ACTIONS = {"start", "stop", "restart"}
+# NEW: Konstante für erlaubte docker-compose Befehle
+ALLOWED_DOCKER_COMMANDS = {
+    'up', 'down', 'restart', 'ps', 'logs', 
+    'start', 'stop', 'config', 'exec'
+}
 
 class RemoteControl(commands.Cog):
     def __init__(self, bot):
@@ -360,12 +365,51 @@ class RemoteControl(commands.Cog):
         await self.bot.wait_until_ready()
 
     # ===== TECHNISCHE FUNKTIONEN =====
+    # NEW: Sichere Shell-Befehlsausführung für non-docker Befehle
+    async def _safe_shell_command(
+        self,
+        cmd: List[str],
+        timeout: int = 60
+    ) -> subprocess.CompletedProcess:
+        """Sichere Shell-Befehlsausführung mit Timeout (ohne docker-compose Einschränkungen)"""
+        if not all(isinstance(arg, str) for arg in cmd):
+            raise ValueError("Alle Kommando-Argumente müssen Strings sein")
+        
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd,
+                    cwd=COMPOSE_PATH,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False
+                )
+            )
+        except subprocess.TimeoutExpired:
+            logger.error(f"Command timeout: {' '.join(cmd)}")
+            raise
+        except Exception as e:
+            logger.error(f"Command failed: {e}")
+            raise
+
+    # MODIFIED: Sichere docker-compose Ausführung mit erweiterter Validierung
     async def _safe_docker_command(
         self,
         cmd: List[str],
         timeout: int = 60
     ) -> subprocess.CompletedProcess:
         """Sichere docker-compose Ausführung mit Timeout"""
+        # Validate command structure - only docker-compose allowed
+        if not cmd or cmd[0] != 'docker-compose':
+            raise ValueError("Only docker-compose commands allowed")
+        
+        if len(cmd) < 2 or cmd[1] not in ALLOWED_DOCKER_COMMANDS:
+            raise ValueError(f"Command not allowed: {cmd[1]}")
+        
+        # Check that all arguments are strings
         if not all(isinstance(arg, str) for arg in cmd):
             raise ValueError("Alle Kommando-Argumente müssen Strings sein")
         
@@ -551,6 +595,7 @@ class RemoteControl(commands.Cog):
         """Prüfe ob ein ENV-Schlüssel gültig ist (einfache Injection-Vermeidung)"""
         return bool(key) and all(c.isalnum() or c == '_' for c in key) and key.isupper()
 
+    # MODIFIED: Jetzt mit _safe_shell_command statt _safe_docker_command
     async def set_config(self, key: str, value: str) -> bool:
         """Setze Config-Wert in .env"""
         try:
@@ -559,22 +604,23 @@ class RemoteControl(commands.Cog):
                 return False
             
             safe_value = shlex.quote(value)
-            check_result = await self._safe_docker_command(["grep", f"^{key}=", ".env"])
+            check_result = await self._safe_shell_command(["grep", f"^{key}=", ".env"])
             
             if check_result.returncode == 0:
-                result = await self._safe_docker_command(["sed", "-i", f"s/^{key}=.*/{key}={safe_value}/", ".env"])
+                result = await self._safe_shell_command(["sed", "-i", f"s/^{key}=.*/{key}={safe_value}/", ".env"])
             else:
-                result = await self._safe_docker_command(["bash", "-c", f'echo "{key}={safe_value}" >> .env'])
+                result = await self._safe_shell_command(["bash", "-c", f'echo "{key}={safe_value}" >> .env'])
             
             return result.returncode == 0
         except Exception as e:
             logger.error(f"Fehler beim Setzen der Config {key}={value}: {e}")
             return False
 
+    # MODIFIED: Jetzt mit _safe_shell_command statt _safe_docker_command
     async def get_config(self, key: str) -> str:
         """Hole Config-Wert aus .env"""
         try:
-            result = await self._safe_docker_command(["grep", f"^{key}=", ".env"])
+            result = await self._safe_shell_command(["grep", f"^{key}=", ".env"])
             if result.returncode == 0:
                 return result.stdout.strip().split('=', 1)[1]
             return "Nicht gefunden"
@@ -582,10 +628,11 @@ class RemoteControl(commands.Cog):
             logger.error(f"Fehler beim Lesen der Config {key}: {e}")
             return "Fehler beim Lesen"
 
+    # MODIFIED: Jetzt mit _safe_shell_command statt _safe_docker_command
     async def get_all_configs(self) -> Dict[str, str]:
         """Hole alle Configs"""
         try:
-            result = await self._safe_docker_command(["cat", ".env"])
+            result = await self._safe_shell_command(["cat", ".env"])
             configs = {}
             for line in result.stdout.strip().split('\n'):
                 if '=' in line and not line.startswith('#'):

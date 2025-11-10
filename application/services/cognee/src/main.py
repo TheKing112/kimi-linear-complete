@@ -1,10 +1,3 @@
-"""
-Cognee Memory API - Vektor-Datenbank für Code-Memories
-- Semantic Search mit Sentence-Transformers
-- Knowledge Graph Extraktion
-- PostgreSQL mit pgvector
-"""
-
 import os
 import logging
 import json
@@ -89,8 +82,13 @@ user_request_times = defaultdict(list)
 # Konstanten
 EMBEDDING_DIM = 384  # Für all-MiniLM-L6-v2
 KNOWLEDGE_CONFIDENCE_THRESHOLD = 0.7
-# ✅ KORRIGIERT: Set statt Dict für direkte Spaltenvalidierung
-ALLOWED_COLUMNS = {"created_at", "updated_at", "id"}
+
+# ✅ KORRIGIERT: Prepared Statement Sicherheit mit Column Mapping
+COLUMN_MAP = {
+    'created_at': 'created_at',
+    'updated_at': 'updated_at', 
+    'id': 'id'
+}
 
 # Hilfsfunktionen
 def load_embeddings_model():
@@ -256,10 +254,14 @@ async def startup_event():
 @rate_limit(max_requests=100, window=60)
 async def store_memory(request: MemoryRequest):
     """Speichere Memory atomar mit Knowledge Graph"""
+    # ✅ Embedding außerhalb Transaction generieren (Read-Only Operation)
     try:
-        # Generiere Embedding außerhalb Transaction (kann lange dauern)
         embedding = generate_embedding(request.content)
-        
+    except Exception as e:
+        logger.error(f"Embedding generation failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Embedding generation failed: {e}")
+    
+    try:
         async with db_pool.acquire() as conn:
             async with conn.transaction():  # ✅ Transaction
                 # Speichere Memory
@@ -347,12 +349,12 @@ async def get_user_memories(
 ):
     """Hole Memories mit Pagination"""
     try:
-        # ✅ KORRIGIERT: Input validieren für Sets
-        order_by_clean = order_by.strip().lower()
-        if order_by_clean not in ALLOWED_COLUMNS:
+        # ✅ KORRIGIERT: Prepared Statement Sicherheit mit Column Mapping
+        order_col = COLUMN_MAP.get(order_by.strip().lower())
+        if not order_col:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Invalid order_by column. Allowed: {', '.join(sorted(ALLOWED_COLUMNS))}"
+                detail=f"Invalid order_by column. Allowed: {', '.join(sorted(COLUMN_MAP.keys()))}"
             )
         
         async with db_pool.acquire() as conn:
@@ -362,12 +364,12 @@ async def get_user_memories(
                 user_id
             )
             
-            # ✅ SICHER: Direkte Verwendung nach Validierung
+            # ✅ SICHER: Direkte Verwendung nach Validierung durch Mapping
             rows = await conn.fetch(f"""
                 SELECT id, content, metadata, created_at
                 FROM memories
                 WHERE user_id = $1
-                ORDER BY {order_by_clean} DESC
+                ORDER BY {order_col} DESC
                 LIMIT $2 OFFSET $3
             """, user_id, limit, offset)
         

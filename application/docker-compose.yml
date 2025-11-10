@@ -86,9 +86,10 @@ services:
       - CUDA_VISIBLE_DEVICES=0,1,2,3
       - HF_TOKEN=${HF_TOKEN:-""}
     volumes:
-      - ./models/kimi-linear-48b:${MODEL_PATH}:rw
-      - ./services/kimi-linear:/app:ro
+      - model_cache:${MODEL_PATH}  # ✅ Named volume
+      - ./services/kimi-linear/src:/app/src:ro
       - ~/.cache/huggingface:/root/.cache/huggingface
+      - kimi_logs:/app/logs  # ✅ Separate logs volume
     ports:
       - "8003:8003"
     depends_on:
@@ -373,6 +374,7 @@ volumes:
   cognee_logs:
   github_logs:
   model_cache:
+  kimi_logs:  # ✅ Neuer Volume für Kimi Logs
 
 networks:
   kimi-network:

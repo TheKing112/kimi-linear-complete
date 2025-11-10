@@ -24,6 +24,28 @@ from remote_control import setup_remote_control
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("kimi-bot-master")
 
+# ✅ NEU: GPU-Speicher-Check Funktion
+def check_gpu_memory_available(required_gb: float = 1.5) -> bool:
+    """
+    Prüft verfügbaren GPU-Speicher (NVIDIA) sicher mit Fallback.
+    Gibt True zurück falls Check nicht möglich (fail-open für CPU-Modi).
+    """
+    try:
+        import pynvml  # Optional: nur wenn GPU verfügbar
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = pynvml.nvmlDeviceGetMemoryInfo()
+        available_gb = info.free / (1024**3)
+        pynvml.nvmlShutdown()
+        logger.info(f"GPU Check: {available_gb:.2f}/{required_gb} GB frei")
+        return available_gb >= required_gb
+    except ImportError:
+        logger.debug("pynvml nicht installiert, überspringe GPU-Check")
+        return True  # Annahme: CPU-Modus oder ausreichend Speicher
+    except Exception as e:
+        logger.warning(f"GPU-Check fehlgeschlagen: {e} (Annahme: genug Speicher)")
+        return True  # Fail-open: keine Blockierung bei Check-Fehlern
+
 # FastAPI Health App
 health_app = FastAPI(
     title="Discord Bot Health API",
@@ -32,8 +54,14 @@ health_app = FastAPI(
 
 @health_app.get("/health")
 async def health_check():
-    """Bot Health Status"""
+    """Bot Health Status mit GPU-Memory Info"""
     uptime = (datetime.now(timezone.utc) - bot.start_time).total_seconds() if hasattr(bot, 'start_time') else 0
+    
+    # ✅ NEU: GPU-Speicher-Status
+    gpu_status = {
+        "sufficient": check_gpu_memory_available(required_gb=1.5),
+        "required_gb": 1.5
+    }
     
     return {
         "status": "healthy" if bot.is_ready() else "starting",
@@ -45,7 +73,8 @@ async def health_check():
             "http_session": bot.session is not None and not bot.session.closed,
             "kimi_linear": bool(os.getenv("KIMI_LINEAR_URL")),
             "cognee": bool(os.getenv("COGNEE_URL")),
-            "github_integration": bool(os.getenv("GITHUB_INTEGRATION_URL"))
+            "github_integration": bool(os.getenv("GITHUB_INTEGRATION_URL")),
+            "gpu_memory": gpu_status  # ✅ NEU
         },
         "metrics": {
             "latency_ms": round(bot.latency * 1000, 2) if bot.latency else None,
@@ -155,27 +184,28 @@ class KimiBot(commands.Bot):
         logger.info("🌐 Health Check Server gestartet auf Port 8005")
         
     async def close(self):
-        """Aufräumen beim Herunterfahren mit vollständiger Ressourcen-Freigabe"""
-        # HTTP Session schließen
-        try:
-            if self.session and not self.session.closed:
-                await self.session.close()
-                # Warte auf asynchrone Cleanup-Operationen
-                await asyncio.sleep(0.5)
+        """Aufräumen beim Herunterfahren mit vollständiger Ressourcen-Freigabe und Timeouts"""
+        
+        # ✅ HTTP Session mit Timeout schließen
+        if self.session and not self.session.closed:
+            try:
+                await asyncio.wait_for(self.session.close(), timeout=2.0)
                 logger.info("✅ HTTP Session erfolgreich geschlossen")
-        except Exception as e:
-            logger.error(f"❌ Fehler beim Schließen der HTTP Session: {e}")
-
-        # Health Server Executor herunterfahren
-        try:
-            if self.health_executor:
-                # Nicht-blockierend herunterfahren, da der Event Loop bereits stoppt
+            except asyncio.TimeoutError:
+                logger.warning("⚠️ Session-Timeout beim Schließen, force-close...")
+                await self.session.close()  # Erzwingen
+            except Exception as e:
+                logger.error(f"❌ Fehler beim Schließen der HTTP Session: {e}")
+        
+        # ✅ Health Server Executor herunterfahren
+        if self.health_executor:
+            try:
                 self.health_executor.shutdown(wait=False)
                 logger.info("✅ Health-Server Executor heruntergefahren")
-        except Exception as e:
-            logger.error(f"❌ Fehler beim Herunterfahren des Executors: {e}")
-
-        # Discord.py Cleanup
+            except Exception as e:
+                logger.error(f"❌ Fehler beim Herunterfahren des Executors: {e}")
+        
+        # ✅ Discord.py Cleanup
         await super().close()
 
 # ✅ NEU - Mit Lock für Thread-Safety
@@ -320,7 +350,13 @@ async def generate_with_kimi(
     max_retries: int = 3,
     base_delay: float = 2.0
 ) -> Optional[dict]:
-    """Rufe Kimi Linear API auf mit Retry-Logik"""
+    """Rufe Kimi Linear API auf mit Retry-Logik und GPU-Speicher-Check"""
+    
+    # ✅ NEU: GPU-Speicher-Verfügbarkeit prüfen
+    if not check_gpu_memory_available(required_gb=1.5):
+        logger.error("GPU-Speicher unzureichend für Kimi-Generierung")
+        raise BotError("GPU_MEMORY", "Unzureichender GPU-Speicher (benötigt: 1.5GB)")
+    
     for attempt in range(max_retries):
         try:
             payload = {"prompt": prompt, "max_tokens": 2048, "temperature": 0.2, "top_p": 0.95}

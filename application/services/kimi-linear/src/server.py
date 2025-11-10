@@ -371,7 +371,7 @@ async def generate(request: GenerateRequest):
     # ✅ NEU - Memory Check
     if not check_memory_available(required_gb=1.5):
         raise HTTPException(
-           _code=503,
+            status_code=503,  # ✅ FIX: _code -> status_code
             detail="Insufficient GPU memory. Please try again later."
         )
     
@@ -401,7 +401,10 @@ async def generate(request: GenerateRequest):
             raise HTTPException(status_code=500, detail=str(e))
 
 # ✅ NEU & KORRIGIERT: Vollständige Funktion mit OOM-Recovery und GPU-Serialisierung
-async def generate_internal(request: GenerateRequest) -> GenerateResponse:
+async def generate_internal(
+    request: GenerateRequest,
+    _retry_count: int = 0  # ✅ Track retries
+) -> GenerateResponse:
     """Interne Generierungslogik mit OOM-Wiederherstellung und GPU-Serialisierung"""
     async with _generation_lock:  # ✅ GPU-Zugriff serialisieren
         try:
@@ -414,11 +417,11 @@ async def generate_internal(request: GenerateRequest) -> GenerateResponse:
             
             input_length = inputs["input_ids"].shape[1]
             
-            # Generierung (synchron, aber durch Lock geschützt)
-            # TODO: Für echte Non-Blocking-Operation in Produktivsystemen:
-            # outputs = await asyncio.to_thread(model.generate, **params)
-            with torch.no_grad():
-                outputs = model.generate(
+            # Generierung (non-blocking via ThreadPoolExecutor)
+            loop = asyncio.get_event_loop()
+            outputs = await loop.run_in_executor(
+                None,  # Default ThreadPoolExecutor
+                lambda: model.generate(
                     **inputs,
                     max_new_tokens=request.max_tokens,
                     temperature=request.temperature,
@@ -428,6 +431,7 @@ async def generate_internal(request: GenerateRequest) -> GenerateResponse:
                     eos_token_id=tokenizer.eos_token_id,
                     use_cache=True
                 )
+            )
             
             # Nur neue Tokens dekodieren
             generated_tokens = outputs[0][input_length:]
@@ -450,12 +454,12 @@ async def generate_internal(request: GenerateRequest) -> GenerateResponse:
             if "out of memory" in str(e).lower():
                 logger.error("CUDA OOM erkannt, versuche Wiederherstellung...")
                 torch.cuda.empty_cache()
+                gc.collect()  # Force garbage collection
                 
-                # Reduziere Tokens und versuche es erneut (nur einmal)
-                if request.max_tokens > 512:
-                    logger.warning(f"Reduziere max_tokens von {request.max_tokens} auf 512")
+                if _retry_count == 0 and request.max_tokens > 512:
+                    logger.warning("OOM: Retrying with reduced tokens")
                     request.max_tokens = 512
-                    return await generate_internal(request)  # Einmaliger Retry
+                    return await generate_internal(request, _retry_count=1)
                 
                 raise HTTPException(
                     status_code=503,

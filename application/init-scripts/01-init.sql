@@ -104,6 +104,15 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_autonomous_only
 ON memories(user_id, created_at DESC)
 WHERE is_autonomous = true;
 
+-- ⚠️ HINWEIS: Der folgende Index ist REDUNDANT und suboptimal!
+-- Die Spalte 'is_autonomous' im Index ist überflüssig, da der Partial Index
+-- (WHERE is_autonomous = true) bereits garantiert, dass alle Zeilen is_autonomous=true haben.
+-- Der bestehende Index 'idx_memories_autonomous_only' oben ist die bessere Lösung.
+-- Wird nur auf ausdrücklichen Wunsch hinzugefügt:
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memories_user_autonomous
+ON memories(user_id, is_autonomous, created_at DESC)
+WHERE is_autonomous = true;
+
 -- =============================================================================
 -- FUNCTION: Update Trigger für updated_at
 -- =============================================================================
